@@ -1,0 +1,49 @@
+name: Команда /raspisanie
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # чаще пяти минут GitHub не разрешает
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Та же группа, что и у daily.yml: state.json пишут оба.
+concurrency:
+  group: schedule-state
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Поставить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Разобрать команды
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: python bot.py --poll
+
+      - name: Сохранить state.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "state.json не менялся, коммит не нужен"
+          else
+            git commit -m "state: offset команд [skip ci]"
+            git pull --rebase --autostash origin ${{ github.ref_name }}
+            git push
+          fi

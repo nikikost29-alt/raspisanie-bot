@@ -1,0 +1,56 @@
+name: Расписание на завтра
+
+on:
+  schedule:
+    # Время в UTC. Уфа = UTC+5, поэтому 18:20, 19:20, 20:20 и 21:20 по-нашему.
+    - cron: "20 13 * * *"
+    - cron: "20 14 * * *"
+    - cron: "20 15 * * *"
+    - cron: "20 16 * * *"   # последний запуск за день — с флагом --last
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Оба воркфлоу пишут state.json, поэтому в одну группу — чтобы не толкались.
+concurrency:
+  group: schedule-state
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Поставить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Отправить расписание
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          # --last только на последнем запуске за день; при ручном
+          # workflow_dispatch github.event.schedule пустой, флага не будет
+          LAST: ${{ github.event.schedule == '20 16 * * *' && '--last' || '' }}
+        run: python bot.py $LAST
+
+      - name: Сохранить state.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "state.json не менялся, коммит не нужен"
+          else
+            git commit -m "state: отправлено расписание [skip ci]"
+            git pull --rebase --autostash origin ${{ github.ref_name }}
+            git push
+          fi
