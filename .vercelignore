@@ -2,10 +2,12 @@
 .env.local
 .env
 
-# Всё, что вебхуку не нужно
+# Вебхуку нужны только app.py, bot.py и parser.py. Всё остальное — мимо.
+# Проверено запуском в песочнице, где ничего из перечисленного нет.
 .venv/
 __pycache__/
 .github/
 reports/
 state.json
 merge_state.py
+README.md

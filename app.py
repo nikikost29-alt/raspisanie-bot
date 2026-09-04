@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Вебхук Telegram на Vercel: команда /raspisanie.
+Вебхук Telegram для команды /raspisanie. Точка входа приложения на Vercel.
 
-Почему вебхук, а не getUpdates в Actions: GitHub не соблюдает крон */5 —
-по факту прогоны случались раз в несколько часов, и команда висела
-неотвеченной. Вебхук приходит мгновенно.
+Почему файл называется app.py и лежит в корне: Vercel ищет точку входа
+Python в app.py / index.py / server.py / main.py / wsgi.py / asgi.py (или в
+src/, app/) и берёт из неё переменную `app`. Раскладка с api/*.py и классом
+handler у них помечена как «для существующих проектов», и наш деплой по ней
+не пошёл: детектор точки входа отработал раньше и упал с "No python
+entrypoint found in default locations". Здесь обычное WSGI-приложение —
+никакого фреймворка, никакой лишней зависимости.
 
-Вся логика (парсер сайта, разбор команды, формат сообщения, отправка)
-живёт в parser.py и bot.py в корне репозитория — здесь только приём HTTP,
-проверка, что запрос от Telegram, и защита от повторов.
+При такой схеме Vercel отправляет в приложение ВСЕ запросы, поэтому адрес
+вебхука может быть любым; оставляем /api/telegram, он говорящий.
 
-Переменные окружения (задаются в настройках проекта Vercel):
+Вся логика — в parser.py и bot.py в этом же каталоге, здесь только приём
+HTTP, проверка что запрос от Telegram, и защита от повторов.
+
+Переменные окружения (Settings → Environment Variables в проекте Vercel):
     BOT_TOKEN        токен бота
     CHAT_ID          id группы, где бот отвечает
     OWNER_ID         личка владельца: и команды, и сообщения об ошибках
@@ -21,21 +27,14 @@
 
 import json
 import os
-import sys
 import traceback
-from http.server import BaseHTTPRequestHandler
 
-# parser.py и bot.py лежат в корне репозитория, на уровень выше api/
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-import bot  # noqa: E402
+import bot
 
 # Файловая система на Vercel только для чтения, писать можно в /tmp.
 # Инстанс живёт между вызовами, пока "тёплый", поэтому этого хватает,
 # чтобы не ответить дважды на один и тот же update_id.
-SEEN_FILE = "/tmp/raspisanie_seen.json"
+SEEN_FILE = os.environ.get("SEEN_FILE", "/tmp/raspisanie_seen.json")
 SEEN_KEEP = 500
 
 _username = None   # имя бота из getMe, спрашиваем один раз на инстанс
@@ -70,7 +69,7 @@ def remember(update_id):
         pass  # не смогли записать — переживём, множество в памяти осталось
 
 
-def check_secret(headers):
+def check_secret(secret_header):
     """
     True, если запрос действительно от Telegram.
 
@@ -81,7 +80,7 @@ def check_secret(headers):
     if not secret:
         print("ВНИМАНИЕ: WEBHOOK_SECRET не задан, запросы никак не проверяются")
         return True
-    return headers.get("X-Telegram-Bot-Api-Secret-Token", "") == secret
+    return secret_header == secret
 
 
 def handle_update(update):
@@ -92,8 +91,7 @@ def handle_update(update):
     update_id = update.get("update_id")
     message = (update.get("message") or update.get("edited_message")
                or update.get("channel_post") or {})
-    chat = message.get("chat") or {}
-    chat_id = str(chat.get("id", ""))
+    chat_id = str((message.get("chat") or {}).get("id", ""))
 
     arg = bot.parse_command(message, bot_username())
     if arg is None:
@@ -128,42 +126,41 @@ def report_to_owner(error_text):
         print("не смог сообщить владельцу:", exc)
 
 
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python runtime ищет в модуле класс с именем handler."""
-
-    def _reply(self, note):
-        # Telegram ВСЕГДА получает 200: любой другой код заставит его
-        # повторять доставку этого апдейта снова и снова.
-        body = json.dumps({"ok": True, "note": note}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        try:
-            if not check_secret(self.headers):
-                print("запрос с неверным X-Telegram-Bot-Api-Secret-Token, игнор")
-                self._reply("ignored")
-                return
-
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
+def app(environ, start_response):
+    """
+    WSGI-приложение. Telegram ВСЕГДА получает 200: любой другой код заставит
+    его повторять доставку этого апдейта снова и снова.
+    """
+    note = "ok"
+    try:
+        if environ.get("REQUEST_METHOD", "GET").upper() != "POST":
+            note = "вебхук расписания жив, шлите POST от Telegram"
+        elif not check_secret(
+                environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")):
+            print("запрос с неверным X-Telegram-Bot-Api-Secret-Token, игнор")
+            note = "ignored"
+        else:
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or 0)
+            except ValueError:
+                length = 0
+            raw = environ["wsgi.input"].read(length) if length else b""
             update = json.loads(raw.decode("utf-8") or "{}")
-
             note = handle_update(update)
             print(note)
-            self._reply(note)
-        except Exception:
-            trace = traceback.format_exc()
-            print(trace)
-            report_to_owner(trace[-1500:])
-            self._reply("error")
+    except Exception:
+        trace = traceback.format_exc()
+        print(trace)
+        report_to_owner(trace[-1500:])
+        note = "error"
 
-    def do_GET(self):
-        # чтобы можно было открыть адрес в браузере и убедиться, что живо
-        self._reply("вебхук расписания жив, шлите POST от Telegram")
+    body = json.dumps({"ok": True, "note": note}, ensure_ascii=False).encode("utf-8")
+    start_response("200 OK", [
+        ("Content-Type", "application/json; charset=utf-8"),
+        ("Content-Length", str(len(body))),
+    ])
+    return [body]
 
-    def log_message(self, fmt, *args):
-        pass  # свои print-ы информативнее стандартного лога
+
+# псевдоним на случай, если Vercel возьмёт точку входа как WSGI application
+application = app
