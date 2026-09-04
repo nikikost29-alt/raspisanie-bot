@@ -242,15 +242,22 @@ def send(text, chat_id):
 # Состояние
 # --------------------------------------------------------------------------
 
+ANSWERED_KEEP = 200  # сколько id отвеченных команд помним
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"sent": {}}
+        return {"sent": {}, "answered": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as fh:
             state = json.load(fh)
     except (ValueError, OSError):
-        return {"sent": {}}
+        return {"sent": {}, "answered": []}
     state.setdefault("sent", {})
+    # id команд, на которые уже ответили. Очередь Telegram читают двое —
+    # Actions и запуск с ноутбука, — и оба могут получить один и тот же
+    # апдейт. По этому списку второй поймёт, что отвечать не надо.
+    state.setdefault("answered", [])
     return state
 
 
@@ -437,12 +444,24 @@ def _describe(update):
     )
 
 
+def _remember_answered(state, update_id):
+    answered = state.setdefault("answered", [])
+    if update_id not in answered:
+        answered.append(update_id)
+    del answered[:-ANSWERED_KEEP]
+
+
 def poll(dry):
     """
     Разобрать накопившиеся команды.
 
-    Offset двигаем только по успешно обработанным апдейтам: если на каком-то
-    из них упали, следующий запуск начнёт ровно с него и команда не потеряется.
+    Очередь Telegram читают двое: GitHub Actions и запуск с ноутбука. Кто
+    первым позвал getUpdates — тот и получил апдейт, поэтому:
+      * offset записывается сразу после КАЖДОГО удачно отправленного ответа,
+        а не одним махом в конце — упали на третьей команде, первые две
+        всё равно зачтены;
+      * id отвеченных команд помним в state["answered"], и если тот же
+        апдейт достанется второму читателю, он не ответит второй раз.
     """
     state = load_state()
     start = state.get("offset", 0)
@@ -451,22 +470,29 @@ def poll(dry):
     me = get_me()
     username = (me.get("username") or "").lower()
     allowed = {env("CHAT_ID"), env("OWNER_ID")}
+    already = set(state.get("answered", []))
 
     print("бот @%s, privacy mode %s (can_read_all_group_messages=%s)" % (
         me.get("username"),
         "выключен" if me.get("can_read_all_group_messages") else "ВКЛЮЧЁН",
         me.get("can_read_all_group_messages"),
     ))
-    print("offset на входе: %d, апдейтов пришло: %d" % (start, len(updates)))
+    print("свои чаты: %s" % ", ".join(sorted(allowed)))
+    print("offset на входе: %d, апдейтов пришло: %d, id: %s" % (
+        start, len(updates),
+        ", ".join(str(u.get("update_id")) for u in updates) or "—",
+    ))
     if not updates:
-        print("пусто. Если команда в группе была, а её тут нет — виноват "
-              "privacy mode или её уже забрал предыдущий запуск")
+        print("очередь пуста. Если команда в группе была, а её тут нет — либо "
+              "включён privacy mode, либо апдейт уже забрал другой читатель "
+              "(соседний прогон Actions или локальный запуск)")
     for update in updates:
         print("  " + _describe(update))
 
     done = start
     answered = 0
     for update in updates:
+        uid = update.get("update_id", 0)
         try:
             message = (update.get("message") or update.get("edited_message")
                        or update.get("channel_post") or {})
@@ -474,36 +500,45 @@ def poll(dry):
             chat_id = str((message.get("chat") or {}).get("id", ""))
 
             if arg is None:
-                pass  # не наша команда
+                print("  #%s: не команда, пропускаем" % uid)
             elif chat_id not in allowed:
-                print("  #%s: команда из чужого чата %s — молчим"
-                      % (update.get("update_id"), chat_id))
+                print("  #%s: КОМАНДА из чужого чата %s — молчим" % (uid, chat_id))
+            elif uid in already:
+                print("  #%s: КОМАНДА, но на неё уже отвечали — пропускаем" % uid)
             else:
+                print("  #%s: КОМАНДА %r из чата %s" % (uid, arg, chat_id))
                 try:
                     day, words = resolve_day(arg)
                 except ValueError:
                     text = HELP
                 else:
                     text, _ = build(day, words)
+
                 if dry:
-                    print("  #%s: ОТВЕТ в %s (не отправляем, --dry):\n%s"
-                          % (update.get("update_id"), chat_id, text))
+                    print("     --dry, не отправляем. Отправили бы: %s"
+                          % text.split("\n")[0])
                 else:
-                    send(text, chat_id)
-                    print("  #%s: ответил в %s на %r"
-                          % (update.get("update_id"), chat_id, arg))
+                    message_id = send(text, chat_id)
+                    print("     отправлено в %s, message_id=%s, первая строка: %s"
+                          % (chat_id, message_id, text.split("\n")[0]))
+                    # offset двигаем и пишем на диск ТОЛЬКО после того,
+                    # как ответ реально ушёл
+                    _remember_answered(state, uid)
+                    state["offset"] = uid + 1
+                    save_state(state)
+                    print("     offset записан: %d" % state["offset"])
                 answered += 1
         except Exception:
-            # offset НЕ двигаем дальше этого апдейта — иначе команда пропадёт
-            if not dry and done > start:
+            if not dry:
                 state["offset"] = done
                 save_state(state)
-                print("offset сохранён по последнему успешному: %d" % done)
+                print("упали на #%s, offset оставлен на %d — следующий запуск "
+                      "начнёт с этого апдейта" % (uid, done))
             raise
 
-        done = max(done, update.get("update_id", 0) + 1)
+        done = max(done, uid + 1)
 
-    print("обработано: %d, ответов: %d, offset станет: %d"
+    print("итого: апдейтов %d, ответов %d, offset к записи %d"
           % (len(updates), answered, done))
 
     if dry:
@@ -512,6 +547,7 @@ def poll(dry):
 
     state["offset"] = done
     save_state(state)
+    print("state.json записан, offset = %d" % done)
     return 0
 
 
