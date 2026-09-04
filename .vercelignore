@@ -1,0 +1,11 @@
+# Секреты в деплой не тащим (их и в репозитории нет — .env.local в .gitignore)
+.env.local
+.env
+
+# Всё, что вебхуку не нужно
+.venv/
+__pycache__/
+.github/
+reports/
+state.json
+merge_state.py

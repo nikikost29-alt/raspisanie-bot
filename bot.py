@@ -9,8 +9,6 @@
     python bot.py --dry 02.09.26   # то же, но на конкретную дату (для проверки)
     python bot.py --last       # последний запуск за день: если расписания
                                # ещё нет — предупредить и закрыть день
-    python bot.py --poll       # разобрать команды /raspisanie из getUpdates
-    python bot.py --poll --dry # то же, но ответы печатать, а не отправлять
 """
 
 import json
@@ -63,11 +61,11 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local")
 
 TELEGRAM_API = "https://api.telegram.org/bot%s/sendMessage"
-TELEGRAM_UPDATES = "https://api.telegram.org/bot%s/getUpdates"
 TIMEOUT = 30
 
-# Команда в группе. Имя бота НЕ хардкодим: при старте --poll спрашиваем
-# getMe и сверяем суффикс "@имя" с ним, без учёта регистра.
+# Команда в группе. Разбор команд живёт в вебхуке api/telegram.py, но
+# сам разбор и подписи — здесь, чтобы не дублировать логику.
+# Имя бота НЕ хардкодим: его спрашивают у getMe.
 COMMAND = "/raspisanie"
 # До 19:00 по Екатеринбургу "/raspisanie" без аргумента — про сегодня,
 # после — про завтра.
@@ -110,7 +108,7 @@ def env(name):
     _load_env()
     value = (os.environ.get(name) or "").strip()
     if not value:
-        raise BotError("не задан %s в .env.local" % name)
+        raise BotError("не задан %s (переменная окружения или .env.local)" % name)
     return value
 
 
@@ -242,22 +240,15 @@ def send(text, chat_id):
 # Состояние
 # --------------------------------------------------------------------------
 
-ANSWERED_KEEP = 200  # сколько id отвеченных команд помним
-
-
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"sent": {}, "answered": []}
+        return {"sent": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as fh:
             state = json.load(fh)
     except (ValueError, OSError):
-        return {"sent": {}, "answered": []}
+        return {"sent": {}}
     state.setdefault("sent", {})
-    # id команд, на которые уже ответили. Очередь Telegram читают двое —
-    # Actions и запуск с ноутбука, — и оба могут получить один и тот же
-    # апдейт. По этому списку второй поймёт, что отвечать не надо.
-    state.setdefault("answered", [])
     return state
 
 
@@ -302,28 +293,6 @@ def build(day, words=TOMORROW):
 # --------------------------------------------------------------------------
 # Команда /raspisanie в группе
 # --------------------------------------------------------------------------
-
-def get_updates(offset):
-    """Забрать новые апдейты. Вебхук не ставим, только long-poll с timeout=0."""
-    resp = requests.get(
-        TELEGRAM_UPDATES % env("BOT_TOKEN"),
-        params={
-            "offset": offset,
-            "timeout": 0,
-            "allowed_updates": '["message"]',
-        },
-        timeout=TIMEOUT,
-    )
-    try:
-        payload = resp.json()
-    except ValueError:
-        raise BotError("Telegram ответил не-JSON: HTTP %s" % resp.status_code)
-    if not payload.get("ok"):
-        raise BotError(
-            "getUpdates отказал: %s" % payload.get("description", resp.status_code)
-        )
-    return payload.get("result", [])
-
 
 def get_me():
     """Кто мы такие по мнению Telegram. Имя бота нигде не хардкодим."""
@@ -425,140 +394,11 @@ HELP = (
 )
 
 
-def _describe(update):
-    """Короткая строка про апдейт — чтобы в логе Actions было видно всё."""
-    kind = "message"
-    message = update.get("message")
-    for key in ("edited_message", "channel_post", "edited_channel_post"):
-        if message is None and update.get(key):
-            kind, message = key, update[key]
-    message = message or {}
-    chat = message.get("chat") or {}
-    text = (message.get("text") or message.get("caption") or "").replace("\n", " ")
-    entities = ",".join(
-        e.get("type", "?") for e in (message.get("entities") or [])
-    ) or "-"
-    return "#%s %s chat=%s(%s) ents=%s text=%r" % (
-        update.get("update_id"), kind, chat.get("id"),
-        chat.get("type"), entities, text[:60],
-    )
-
-
-def _remember_answered(state, update_id):
-    answered = state.setdefault("answered", [])
-    if update_id not in answered:
-        answered.append(update_id)
-    del answered[:-ANSWERED_KEEP]
-
-
-def poll(dry):
-    """
-    Разобрать накопившиеся команды.
-
-    Очередь Telegram читают двое: GitHub Actions и запуск с ноутбука. Кто
-    первым позвал getUpdates — тот и получил апдейт, поэтому:
-      * offset записывается сразу после КАЖДОГО удачно отправленного ответа,
-        а не одним махом в конце — упали на третьей команде, первые две
-        всё равно зачтены;
-      * id отвеченных команд помним в state["answered"], и если тот же
-        апдейт достанется второму читателю, он не ответит второй раз.
-    """
-    state = load_state()
-    start = state.get("offset", 0)
-    updates = get_updates(start)
-
-    me = get_me()
-    username = (me.get("username") or "").lower()
-    allowed = {env("CHAT_ID"), env("OWNER_ID")}
-    already = set(state.get("answered", []))
-
-    print("бот @%s, privacy mode %s (can_read_all_group_messages=%s)" % (
-        me.get("username"),
-        "выключен" if me.get("can_read_all_group_messages") else "ВКЛЮЧЁН",
-        me.get("can_read_all_group_messages"),
-    ))
-    print("свои чаты: %s" % ", ".join(sorted(allowed)))
-    print("offset на входе: %d, апдейтов пришло: %d, id: %s" % (
-        start, len(updates),
-        ", ".join(str(u.get("update_id")) for u in updates) or "—",
-    ))
-    if not updates:
-        print("очередь пуста. Если команда в группе была, а её тут нет — либо "
-              "включён privacy mode, либо апдейт уже забрал другой читатель "
-              "(соседний прогон Actions или локальный запуск)")
-    for update in updates:
-        print("  " + _describe(update))
-
-    done = start
-    answered = 0
-    for update in updates:
-        uid = update.get("update_id", 0)
-        try:
-            message = (update.get("message") or update.get("edited_message")
-                       or update.get("channel_post") or {})
-            arg = parse_command(message, username)
-            chat_id = str((message.get("chat") or {}).get("id", ""))
-
-            if arg is None:
-                print("  #%s: не команда, пропускаем" % uid)
-            elif chat_id not in allowed:
-                print("  #%s: КОМАНДА из чужого чата %s — молчим" % (uid, chat_id))
-            elif uid in already:
-                print("  #%s: КОМАНДА, но на неё уже отвечали — пропускаем" % uid)
-            else:
-                print("  #%s: КОМАНДА %r из чата %s" % (uid, arg, chat_id))
-                try:
-                    day, words = resolve_day(arg)
-                except ValueError:
-                    text = HELP
-                else:
-                    text, _ = build(day, words)
-
-                if dry:
-                    print("     --dry, не отправляем. Отправили бы: %s"
-                          % text.split("\n")[0])
-                else:
-                    message_id = send(text, chat_id)
-                    print("     отправлено в %s, message_id=%s, первая строка: %s"
-                          % (chat_id, message_id, text.split("\n")[0]))
-                    # offset двигаем и пишем на диск ТОЛЬКО после того,
-                    # как ответ реально ушёл
-                    _remember_answered(state, uid)
-                    state["offset"] = uid + 1
-                    save_state(state)
-                    print("     offset записан: %d" % state["offset"])
-                answered += 1
-        except Exception:
-            if not dry:
-                state["offset"] = done
-                save_state(state)
-                print("упали на #%s, offset оставлен на %d — следующий запуск "
-                      "начнёт с этого апдейта" % (uid, done))
-            raise
-
-        done = max(done, uid + 1)
-
-    print("итого: апдейтов %d, ответов %d, offset к записи %d"
-          % (len(updates), answered, done))
-
-    if dry:
-        print("--dry: state.json не трогаем, offset остался %d" % start)
-        return 0
-
-    state["offset"] = done
-    save_state(state)
-    print("state.json записан, offset = %d" % done)
-    return 0
-
-
 # --------------------------------------------------------------------------
 
 def run(argv):
     dry = "--dry" in argv
     last = "--last" in argv
-
-    if "--poll" in argv:
-        return poll(dry)
 
     rest = [a for a in argv[1:] if not a.startswith("-")]
     day = schedule._parse_date(rest[0]) if rest else tomorrow()

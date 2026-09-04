@@ -23,6 +23,16 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+# BeautifulSoup парсер: lxml быстрее, но на некоторых хостингах (в частности
+# в Vercel) его колесо может не встать. Тогда молча берём встроенный
+# html.parser — он есть в стандартной библиотеке всегда.
+try:
+    import lxml  # noqa: F401  (проверяем только наличие)
+
+    SOUP_PARSER = "lxml"
+except ImportError:  # pragma: no cover
+    SOUP_PARSER = "html.parser"
+
 INDEX_URL = "https://nf.uust.ru/timetable/fulltime/"
 GROUP = "ИС-41-23к"
 TIMEOUT = 30
@@ -112,7 +122,7 @@ def find_spo_links(index_html, base_url=INDEX_URL):
     Имя файла вида (1)-01.09.26-05.09.26-SPO.html — из него достаём период
     недели, чтобы понять, какой файл соответствует запрошенной дате.
     """
-    soup = BeautifulSoup(index_html, "lxml")
+    soup = BeautifulSoup(index_html, SOUP_PARSER)
     found = [(a["href"].strip(), _norm(a.get_text(" ")))
              for a in soup.find_all("a", href=True)]
 
@@ -150,7 +160,7 @@ def find_spo_links(index_html, base_url=INDEX_URL):
 
 def find_updated_at(index_html):
     """Строка вида "данные на 02.09.2026, 15:36:46" с индексной страницы."""
-    text = BeautifulSoup(index_html, "lxml").get_text(" ")
+    text = BeautifulSoup(index_html, SOUP_PARSER).get_text(" ")
     m = re.search(r"данные\s+на\s*([^)<]+)", text, re.IGNORECASE)
     if not m:
         return None
@@ -325,7 +335,7 @@ def extract_day(timetable_html, target, group=GROUP):
     Возвращает (group_name, weekday, lessons) либо None, если такой даты
     в этом файле нет.
     """
-    soup = BeautifulSoup(timetable_html, "lxml")
+    soup = BeautifulSoup(timetable_html, SOUP_PARSER)
 
     last_error = None
     for table in soup.find_all("table"):
