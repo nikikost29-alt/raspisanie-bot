@@ -126,15 +126,28 @@ def report_to_owner(error_text):
         print("не смог сообщить владельцу:", exc)
 
 
+def env_report():
+    """
+    Какие переменные окружения заведены — только да/нет, без значений.
+
+    Нужно, чтобы диагностировать самую частую беду деплоя (переменные завели
+    в одном проекте Vercel, а работает другой), просто открыв адрес в браузере.
+    """
+    return {name: bool((os.environ.get(name) or "").strip())
+            for name in ("BOT_TOKEN", "CHAT_ID", "OWNER_ID", "WEBHOOK_SECRET")}
+
+
 def app(environ, start_response):
     """
     WSGI-приложение. Telegram ВСЕГДА получает 200: любой другой код заставит
     его повторять доставку этого апдейта снова и снова.
     """
     note = "ok"
+    extra = {}
     try:
         if environ.get("REQUEST_METHOD", "GET").upper() != "POST":
             note = "вебхук расписания жив, шлите POST от Telegram"
+            extra["env"] = env_report()
         elif not check_secret(
                 environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")):
             print("запрос с неверным X-Telegram-Bot-Api-Secret-Token, игнор")
@@ -148,13 +161,18 @@ def app(environ, start_response):
             update = json.loads(raw.decode("utf-8") or "{}")
             note = handle_update(update)
             print(note)
-    except Exception:
+    except Exception as exc:
         trace = traceback.format_exc()
         print(trace)
         report_to_owner(trace[-1500:])
-        note = "error"
+        # В ответ кладём только тип и текст ошибки (без трейса и без значений
+        # переменных) — иначе причину не увидеть, не имея доступа к логам.
+        note = "error: %s: %s" % (type(exc).__name__, exc)
+        extra["env"] = env_report()
 
-    body = json.dumps({"ok": True, "note": note}, ensure_ascii=False).encode("utf-8")
+    payload = {"ok": True, "note": note}
+    payload.update(extra)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     start_response("200 OK", [
         ("Content-Type", "application/json; charset=utf-8"),
         ("Content-Length", str(len(body))),
