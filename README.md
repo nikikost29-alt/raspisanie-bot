@@ -10,6 +10,7 @@
 | `parser.py` | тянет расписание с сайта, отдаёт пары нужной группы |
 | `bot.py` | собирает текст сообщения и отправляет в Telegram |
 | `merge_state.py` | сливает `state.json`, если его пишут одновременно |
+| `set_webhook.py` | прописывает адрес вебхука в Telegram |
 | `.github/workflows/daily.yml` | вечерняя рассылка |
 | `app.py` | вебхук на Vercel: ответы на `/raspisanie` |
 | `state.json` | что уже отправлено и на каком сообщении остановились |
@@ -47,7 +48,23 @@
 сразу, ответ приходит за секунду.
 
 Вебхуку нужны те же `BOT_TOKEN`, `CHAT_ID`, `OWNER_ID` плюс `WEBHOOK_SECRET`
-— их заводят в настройках проекта Vercel, а не в GitHub Secrets.
+— их заводят в настройках проекта Vercel (Environment Variables в боковой
+панели проекта), а не в GitHub Secrets. После добавления нужен Redeploy:
+к уже собранным деплоям новые переменные не применяются.
+
+Открыв адрес функции в браузере, видно, какие переменные она получила:
+
+```
+https://raspisanie-bot.vercel.app/api/telegram
+{"ok": true, "note": "...", "env": {"BOT_TOKEN": true, ...}}
+```
+
+Прописать адрес вебхука (токен подставится из `.env.local`):
+
+```
+.venv\Scripts\python.exe set_webhook.py https://raspisanie-bot.vercel.app/api/telegram
+.venv\Scripts\python.exe set_webhook.py --info
+```
 
 Команда работает только в группе из `CHAT_ID` и в личке с `OWNER_ID`,
 остальные чаты бот игнорирует молча.
