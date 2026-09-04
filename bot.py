@@ -66,12 +66,9 @@ TELEGRAM_API = "https://api.telegram.org/bot%s/sendMessage"
 TELEGRAM_UPDATES = "https://api.telegram.org/bot%s/getUpdates"
 TIMEOUT = 30
 
-# Команда в группе
+# Команда в группе. Имя бота НЕ хардкодим: при старте --poll спрашиваем
+# getMe и сверяем суффикс "@имя" с ним, без учёта регистра.
 COMMAND = "/raspisanie"
-# Имя из ТЗ. Настоящее имя бота может отличаться (getMe говорит
-# Helper_for_table1_Bot), поэтому оно ещё и спрашивается у Telegram —
-# иначе "/raspisanie@настоящее_имя" из группы прошло бы мимо.
-BOT_USERNAME = "helper_po_raspisaniu_bot"
 # До 19:00 по Екатеринбургу "/raspisanie" без аргумента — про сегодня,
 # после — про завтра.
 SWITCH_HOUR = 19
@@ -321,37 +318,66 @@ def get_updates(offset):
     return payload.get("result", [])
 
 
-def bot_username():
-    """Настоящее имя бота из getMe. Пустая строка, если спросить не вышло."""
+def get_me():
+    """Кто мы такие по мнению Telegram. Имя бота нигде не хардкодим."""
+    resp = requests.get(
+        "https://api.telegram.org/bot%s/getMe" % env("BOT_TOKEN"), timeout=TIMEOUT
+    )
     try:
-        resp = requests.get(
-            "https://api.telegram.org/bot%s/getMe" % env("BOT_TOKEN"),
-            timeout=TIMEOUT,
+        payload = resp.json()
+    except ValueError:
+        raise BotError("getMe ответил не-JSON: HTTP %s" % resp.status_code)
+    if not payload.get("ok"):
+        raise BotError(
+            "getMe отказал: %s" % payload.get("description", resp.status_code)
         )
-        return (resp.json()["result"]["username"] or "").lower()
-    except Exception:
-        return ""
+    return payload["result"]
 
 
-def parse_command(text, usernames=None):
+def command_token(message):
+    """
+    Первое слово сообщения, если это команда бота.
+
+    Берём из entities типа bot_command, когда Telegram его разметил, иначе
+    просто первое слово текста — на случай, если entities не пришли.
+    """
+    text = message.get("text") or message.get("caption") or ""
+    if not text:
+        return None, ""
+
+    entities = message.get("entities") or message.get("caption_entities") or []
+    for entity in entities:
+        if entity.get("type") != "bot_command" or entity.get("offset") != 0:
+            continue
+        token = text[: entity.get("length", 0)]
+        return token.strip(), text[entity.get("length", 0):].strip()
+
+    parts = text.strip().split(None, 1)
+    if not parts:
+        return None, ""
+    return parts[0], (parts[1].strip() if len(parts) > 1 else "")
+
+
+def parse_command(message, username):
     """
     Аргумент команды /raspisanie (может быть пустой строкой) либо None,
-    если это вообще не наша команда.
+    если это не наша команда.
 
-    usernames — имена, на которые бот откликается в "/raspisanie@имя".
+    username — настоящее имя бота из getMe, в нижнем регистре. Суффикс
+    "@имя" сверяем без учёта регистра; голая команда без "@" тоже наша.
     """
-    if not text:
+    token, arg = command_token(message)
+    if not token:
         return None
-    known = usernames or {BOT_USERNAME}
-    parts = text.strip().split(None, 1)
-    head = parts[0].lower()
+
+    head = token.strip().lower()
     if "@" in head:
         head, _, mention = head.partition("@")
-        if mention not in known:  # команда адресована другому боту
-            return None
+        if not username or mention != username:
+            return None  # команда адресована другому боту
     if head != COMMAND:
         return None
-    return parts[1].strip() if len(parts) > 1 else ""
+    return arg
 
 
 def resolve_day(arg):
@@ -392,48 +418,99 @@ HELP = (
 )
 
 
-def poll(dry):
-    """Разобрать накопившиеся команды. Offset сохраняем всегда."""
-    state = load_state()
-    offset = state.get("offset", 0)
-    updates = get_updates(offset)
-    allowed = {env("CHAT_ID"), env("OWNER_ID")}
-    usernames = {BOT_USERNAME}
-    if updates:  # лишний запрос к API делаем только когда есть что разбирать
-        usernames.add(bot_username())
+def _describe(update):
+    """Короткая строка про апдейт — чтобы в логе Actions было видно всё."""
+    kind = "message"
+    message = update.get("message")
+    for key in ("edited_message", "channel_post", "edited_channel_post"):
+        if message is None and update.get(key):
+            kind, message = key, update[key]
+    message = message or {}
+    chat = message.get("chat") or {}
+    text = (message.get("text") or message.get("caption") or "").replace("\n", " ")
+    entities = ",".join(
+        e.get("type", "?") for e in (message.get("entities") or [])
+    ) or "-"
+    return "#%s %s chat=%s(%s) ents=%s text=%r" % (
+        update.get("update_id"), kind, chat.get("id"),
+        chat.get("type"), entities, text[:60],
+    )
 
+
+def poll(dry):
+    """
+    Разобрать накопившиеся команды.
+
+    Offset двигаем только по успешно обработанным апдейтам: если на каком-то
+    из них упали, следующий запуск начнёт ровно с него и команда не потеряется.
+    """
+    state = load_state()
+    start = state.get("offset", 0)
+    updates = get_updates(start)
+
+    me = get_me()
+    username = (me.get("username") or "").lower()
+    allowed = {env("CHAT_ID"), env("OWNER_ID")}
+
+    print("бот @%s, privacy mode %s (can_read_all_group_messages=%s)" % (
+        me.get("username"),
+        "выключен" if me.get("can_read_all_group_messages") else "ВКЛЮЧЁН",
+        me.get("can_read_all_group_messages"),
+    ))
+    print("offset на входе: %d, апдейтов пришло: %d" % (start, len(updates)))
+    if not updates:
+        print("пусто. Если команда в группе была, а её тут нет — виноват "
+              "privacy mode или её уже забрал предыдущий запуск")
+    for update in updates:
+        print("  " + _describe(update))
+
+    done = start
     answered = 0
     for update in updates:
-        offset = max(offset, update.get("update_id", 0) + 1)
-        message = update.get("message") or update.get("edited_message") or {}
-        arg = parse_command(message.get("text", ""), usernames)
-        if arg is None:
-            continue
-        chat_id = str((message.get("chat") or {}).get("id", ""))
-        if chat_id not in allowed:
-            continue  # чужой чат — молча игнорируем
-
         try:
-            day, words = resolve_day(arg)
-        except ValueError:
-            text = HELP
-        else:
-            text, _ = build(day, words)
+            message = (update.get("message") or update.get("edited_message")
+                       or update.get("channel_post") or {})
+            arg = parse_command(message, username)
+            chat_id = str((message.get("chat") or {}).get("id", ""))
 
-        if dry:
-            print("--> ответ в чат %s:\n%s\n" % (chat_id, text))
-        else:
-            send(text, chat_id)
-        answered += 1
+            if arg is None:
+                pass  # не наша команда
+            elif chat_id not in allowed:
+                print("  #%s: команда из чужого чата %s — молчим"
+                      % (update.get("update_id"), chat_id))
+            else:
+                try:
+                    day, words = resolve_day(arg)
+                except ValueError:
+                    text = HELP
+                else:
+                    text, _ = build(day, words)
+                if dry:
+                    print("  #%s: ОТВЕТ в %s (не отправляем, --dry):\n%s"
+                          % (update.get("update_id"), chat_id, text))
+                else:
+                    send(text, chat_id)
+                    print("  #%s: ответил в %s на %r"
+                          % (update.get("update_id"), chat_id, arg))
+                answered += 1
+        except Exception:
+            # offset НЕ двигаем дальше этого апдейта — иначе команда пропадёт
+            if not dry and done > start:
+                state["offset"] = done
+                save_state(state)
+                print("offset сохранён по последнему успешному: %d" % done)
+            raise
+
+        done = max(done, update.get("update_id", 0) + 1)
+
+    print("обработано: %d, ответов: %d, offset станет: %d"
+          % (len(updates), answered, done))
 
     if dry:
-        print("апдейтов: %d, ответов: %d, offset остался %d (--dry ничего не "
-              "сохраняет)" % (len(updates), answered, state.get("offset", 0)))
+        print("--dry: state.json не трогаем, offset остался %d" % start)
         return 0
 
-    # offset пишем всегда, даже если команд не было, иначе на следующем
-    # запуске те же сообщения приедут снова и бот ответит дважды
-    state["offset"] = offset
+    state["offset"] = done
     save_state(state)
     return 0
 
