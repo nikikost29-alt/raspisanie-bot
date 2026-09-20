@@ -67,8 +67,12 @@ TIMEOUT = 30
 # сам разбор и подписи — здесь, чтобы не дублировать логику.
 # Имя бота НЕ хардкодим: его спрашивают у getMe.
 COMMAND = "/raspisanie"
-# До 19:00 по Екатеринбургу "/raspisanie" без аргумента — про сегодня,
-# после — про завтра.
+# /today — всегда на сегодня, /tm — всегда на завтра.
+# /raspisanie оставлен как был: понимает дату аргументом, а без аргумента
+# до 19:00 по Екатеринбургу показывает сегодня, после — завтра.
+TODAY_COMMAND = "/today"
+TOMORROW_COMMAND = "/tm"
+COMMANDS = (TODAY_COMMAND, TOMORROW_COMMAND, COMMAND)
 SWITCH_HOUR = 19
 
 # Подписи "за какую дату": (слово в шапке, слово в предупреждении)
@@ -336,8 +340,10 @@ def command_token(message):
 
 def parse_command(message, username):
     """
-    Аргумент команды /raspisanie (может быть пустой строкой) либо None,
-    если это не наша команда.
+    Пара (команда, аргумент) либо None, если это не наша команда.
+
+    Команда возвращается в нижнем регистре и без "@имя": "/today", "/tm"
+    или "/raspisanie". Аргумент может быть пустой строкой.
 
     username — настоящее имя бота из getMe, в нижнем регистре. Суффикс
     "@имя" сверяем без учёта регистра; голая команда без "@" тоже наша.
@@ -351,21 +357,28 @@ def parse_command(message, username):
         head, _, mention = head.partition("@")
         if not username or mention != username:
             return None  # команда адресована другому боту
-    if head != COMMAND:
+    if head not in COMMANDS:
         return None
-    return arg
+    return head, arg
 
 
-def resolve_day(arg):
+def resolve_day(command, arg=""):
     """
-    По аргументу команды понять дату и подписи.
+    По команде и её аргументу понять дату и подписи.
 
-    Без аргумента: до 19:00 по Екатеринбургу — сегодня, после — завтра.
-    Понимает "сегодня", "завтра" и дату вида 05.09 (или 05.09.26).
+    /today — сегодня, /tm — завтра, аргумент у них не нужен и игнорируется.
+    /raspisanie без аргумента: до 19:00 по Екатеринбургу — сегодня, после —
+    завтра; с аргументом понимает "сегодня", "завтра" и дату вида 05.09
+    (или 05.09.26).
     """
     now = datetime.now(YEKB)
     today = now.date()
     text = (arg or "").strip().lower()
+
+    if command == TODAY_COMMAND:
+        return today, TODAY
+    if command == TOMORROW_COMMAND:
+        return today + timedelta(days=1), TOMORROW
 
     if not text:
         if now.hour < SWITCH_HOUR:
@@ -388,9 +401,9 @@ def resolve_day(arg):
 
 HELP = (
     "Не понял дату. Пиши так:\n"
-    "/raspisanie — на сегодня или на завтра\n"
-    "/raspisanie завтра\n"
-    "/raspisanie 05.09"
+    "/today — на сегодня\n"
+    "/tm — на завтра\n"
+    "/raspisanie 05.09 — на конкретную дату"
 )
 
 

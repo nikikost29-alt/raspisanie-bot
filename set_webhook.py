@@ -8,6 +8,7 @@
     python set_webhook.py https://raspisanie-bot.vercel.app/api/telegram
     python set_webhook.py --info      # только показать, что сейчас настроено
     python set_webhook.py --dry URL   # показать, что будет сделано, и выйти
+    python set_webhook.py --commands  # обновить меню команд бота в Telegram
 
 drop_pending_updates=true ставится намеренно: пока вебхука не было, в очереди
 Telegram копились сообщения, и без этого бот ответил бы разом на все.
@@ -27,6 +28,26 @@ def call(method, **params):
     resp = requests.get(API % (bot.env("BOT_TOKEN"), method),
                         params=params, timeout=TIMEOUT)
     return resp.json()
+
+
+MENU = [
+    {"command": "today", "description": "Расписание на сегодня"},
+    {"command": "tm", "description": "Расписание на завтра"},
+    {"command": "raspisanie", "description": "На дату: /raspisanie 05.09"},
+]
+
+
+def set_commands():
+    """Подсказки команд в Telegram: список по кнопке «/» рядом с полем ввода."""
+    import json
+
+    result = call("setMyCommands", commands=json.dumps(MENU, ensure_ascii=False))
+    print("setMyCommands:", result)
+    if not result.get("ok"):
+        return 1
+    for item in MENU:
+        print("  /%-11s %s" % (item["command"], item["description"]))
+    return 0
 
 
 def show_info():
@@ -50,6 +71,9 @@ def main(argv):
 
     args = [a for a in argv[1:] if not a.startswith("--")]
     dry = "--dry" in argv
+
+    if "--commands" in argv:
+        return set_commands()
 
     if "--info" in argv:
         show_info()

@@ -93,9 +93,10 @@ def handle_update(update):
                or update.get("channel_post") or {})
     chat_id = str((message.get("chat") or {}).get("id", ""))
 
-    arg = bot.parse_command(message, bot_username())
-    if arg is None:
+    parsed = bot.parse_command(message, bot_username())
+    if parsed is None:
         return "#%s: не команда, игнор" % update_id
+    command, arg = parsed
 
     # свои — группа и личка владельца; из остальных чатов молчим
     allowed = {bot.env("CHAT_ID"), bot.env("OWNER_ID")}
@@ -106,7 +107,7 @@ def handle_update(update):
         return "#%s: повтор, уже отвечали" % update_id
 
     try:
-        day, words = bot.resolve_day(arg)
+        day, words = bot.resolve_day(command, arg)
     except ValueError:
         text = bot.HELP
     else:
@@ -114,8 +115,8 @@ def handle_update(update):
 
     message_id = bot.send(text, chat_id)          # отвечаем в ТОТ ЖЕ чат
     remember(update_id)
-    return "#%s: ответил в %s, message_id=%s, %s" % (
-        update_id, chat_id, message_id, text.split("\n")[0])
+    return "#%s: %s %r -> ответил в %s, message_id=%s, %s" % (
+        update_id, command, arg, chat_id, message_id, text.split("\n")[0])
 
 
 def report_to_owner(error_text):
