@@ -30,6 +30,7 @@ import os
 import traceback
 
 import bot
+import homework
 
 # Файловая система на Vercel только для чтения, писать можно в /tmp.
 # Инстанс живёт между вызовами, пока "тёплый", поэтому этого хватает,
@@ -94,17 +95,30 @@ def handle_update(update):
     chat_id = str((message.get("chat") or {}).get("id", ""))
 
     parsed = bot.parse_command(message, bot_username())
-    if parsed is None:
+    text_in = message.get("text") or message.get("caption") or ""
+    is_homework = parsed is None and homework.note_from(text_in) is not None
+    if parsed is None and not is_homework:
         return "#%s: не команда, игнор" % update_id
-    command, arg = parsed
 
     # свои — группа и личка владельца; из остальных чатов молчим
     allowed = {bot.env("CHAT_ID"), bot.env("OWNER_ID")}
     if chat_id not in allowed:
-        return "#%s: команда из чужого чата %s, игнор" % (update_id, chat_id)
+        return "#%s: сообщение из чужого чата %s, игнор" % (update_id, chat_id)
 
     if update_id in seen_ids():
         return "#%s: повтор, уже отвечали" % update_id
+
+    if is_homework:
+        author = ((message.get("from") or {}).get("first_name") or "").strip()
+        answer = homework.catch(text_in, update_id, author)
+        if not answer:
+            return "#%s: «дз!» без новых записей" % update_id
+        message_id = bot.send(answer, chat_id)
+        remember(update_id)
+        return "#%s: дз -> ответил в %s, message_id=%s, %s" % (
+            update_id, chat_id, message_id, answer.split("\n")[0])
+
+    command, arg = parsed
 
     try:
         day, words = bot.resolve_day(command, arg)
@@ -112,6 +126,7 @@ def handle_update(update):
         text = bot.HELP
     else:
         text, _ = bot.build(day, words)
+        text += homework.block_for(day)
 
     message_id = bot.send(text, chat_id)          # отвечаем в ТОТ ЖЕ чат
     remember(update_id)

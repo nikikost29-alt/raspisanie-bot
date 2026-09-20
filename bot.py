@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 
+import homework
 import parser as schedule
 
 # --------------------------------------------------------------------------
@@ -417,9 +418,12 @@ def run(argv):
     day = schedule._parse_date(rest[0]) if rest else tomorrow()
 
     text, is_schedule = build(day)
+    # Блок с дз дописывается только при отправке и НЕ участвует в сравнении
+    # с прошлым разом: иначе новое дз выглядело бы как «расписание изменили».
+    extra = homework.block_for(day) if is_schedule else ""
 
     if dry:
-        print(text)
+        print(text + extra)
         return 0
 
     state = load_state()
@@ -445,7 +449,7 @@ def run(argv):
     else:
         text_to_send = text
 
-    send(text_to_send, env("CHAT_ID"))
+    send(text_to_send + extra, env("CHAT_ID"))
     mark_sent(state, day, text)
     save_state(state)
     return 0

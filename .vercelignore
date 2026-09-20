@@ -2,8 +2,10 @@
 .env.local
 .env
 
-# Вебхуку нужны только app.py, bot.py и parser.py. Всё остальное — мимо.
-# Проверено запуском в песочнице, где ничего из перечисленного нет.
+# Вебхуку нужны только app.py, bot.py, parser.py и homework.py.
+# Остальное — мимо. Проверено запуском в песочнице, собранной по этому
+# же списку. homework.json вебхук читает и пишет через GitHub API,
+# копия в бандле только путала бы.
 .venv/
 __pycache__/
 .github/
@@ -12,3 +14,4 @@ state.json
 merge_state.py
 README.md
 set_webhook.py
+homework.json
