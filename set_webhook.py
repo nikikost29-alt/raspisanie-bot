@@ -34,6 +34,7 @@ MENU = [
     {"command": "today", "description": "Расписание на сегодня"},
     {"command": "tm", "description": "Расписание на завтра"},
     {"command": "raspisanie", "description": "На дату: /raspisanie 05.09"},
+    {"command": "dz", "description": "Домашние задания на ближайшую дату"},
 ]
 
 

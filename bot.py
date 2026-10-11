@@ -73,7 +73,10 @@ COMMAND = "/raspisanie"
 # до 19:00 по Екатеринбургу показывает сегодня, после — завтра.
 TODAY_COMMAND = "/today"
 TOMORROW_COMMAND = "/tm"
-COMMANDS = (TODAY_COMMAND, TOMORROW_COMMAND, COMMAND)
+# Дз на ближайшую дату. Telegram признаёт командой только латиницу, поэтому
+# в меню — /dz, но и набранное руками «/дз» бот тоже понимает.
+HOMEWORK_COMMANDS = ("/dz", "/дз")
+COMMANDS = (TODAY_COMMAND, TOMORROW_COMMAND, COMMAND) + HOMEWORK_COMMANDS
 SWITCH_HOUR = 19
 
 # Подписи "за какую дату": (слово в шапке, слово в предупреждении)
@@ -405,7 +408,8 @@ HELP = (
     "Не понял дату. Пиши так:\n"
     "/today — на сегодня\n"
     "/tm — на завтра\n"
-    "/raspisanie 05.09 — на конкретную дату"
+    "/raspisanie 05.09 — на конкретную дату\n"
+    "/dz — домашние задания"
 )
 
 
