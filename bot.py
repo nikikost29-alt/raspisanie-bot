@@ -176,7 +176,8 @@ def _footer(updated):
 
 def format_message(result, day, words=TOMORROW):
     """Собрать текст сообщения из словаря parser.get_day()."""
-    lessons = result["lessons"]
+    # «Выходной день» в клетке пары — не пара, а отметка, что учёбы нет
+    lessons = schedule.drop_day_off(result["lessons"])
     if not lessons:
         return free_day_message(day, words)
 

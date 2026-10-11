@@ -27,7 +27,11 @@ import requests
 
 import parser as schedule
 
-MARKER = "дз!"          # ключевое слово в чате
+MARKER = "дз!"          # ключевое слово в чате (так пишем в подсказках)
+# Понимаем и «дз!», и «!дз» — на деле пишут и так, и так. Буквы вокруг
+# не допускаются, чтобы не цеплять куски других слов.
+MARKER_RE = re.compile(
+    r"(?<![а-яёa-z0-9])(?:!\s?дз|дз\s?!)(?![а-яёa-z0-9])", re.IGNORECASE)
 LOOKAHEAD_DAYS = 14     # на сколько дней вперёд ищем предмет в расписании
 KEEP_DAYS = 3           # сколько дней держим уже прошедшие записи
 
@@ -61,25 +65,45 @@ ALIASES = {
 
 MIN_WORD = 4  # слова короче — не пытаемся искать как название предмета
 
+# Слова про само задание, а не про предмет. Ищи мы предмет и по ним, «работу»
+# однажды поймала бы «День методической работы», а «практическую» — практику.
+STOP_WORDS = {
+    "сделать", "сделай", "делать", "доделать", "переделать", "надо", "нужно",
+    "работа", "работу", "работы", "задание", "задания", "задача", "задачи",
+    "написать", "напиши", "прочитать", "прочитай", "выучить", "выучи",
+    "повторить", "решить", "ответить", "подготовить", "подготовиться",
+    "реферат", "доклад", "конспект", "параграф", "презентация", "презентацию",
+    "лаба", "лабу", "лабораторная", "лабораторную", "практическая",
+    "практическую", "тест", "тесты", "вопросы", "упражнение", "номер",
+    "страница", "страницы", "юрайт", "юрайте", "домашка", "домашнее",
+    "завтра", "сегодня", "всем", "кстати",
+}
+
 
 # --------------------------------------------------------------------------
 # Разбор сообщения
 # --------------------------------------------------------------------------
 
-def note_from(text):
+def find_marker(text):
     """
-    Текст после «дз!» либо None, если маркера в сообщении нет.
+    (текст после маркера, маркер_в_начале) либо None, если маркера нет.
 
-    Маркер ищем где угодно в сообщении и без учёта регистра: и «дз! матеша»,
-    и «Народ, ДЗ! по матеше параграф 5» одинаково подойдут.
+    Маркер — «дз!» или «!дз», где угодно в сообщении, без учёта регистра.
+    Где он стоит, важно: «!дз физра справка» — точно запись о дз, а
+    «кто сделал дз!» посреди болтовни — скорее всего нет.
     """
     if not text:
         return None
-    low = text.lower().replace("ё", "е")
-    pos = low.find(MARKER)
-    if pos < 0:
+    m = MARKER_RE.search(text)
+    if not m:
         return None
-    return text[pos + len(MARKER):].strip()
+    return text[m.end():].strip(), not text[:m.start()].strip()
+
+
+def note_from(text):
+    """Текст после «дз!»/«!дз» либо None, если маркера в сообщении нет."""
+    found = find_marker(text)
+    return None if found is None else found[0]
 
 
 def _norm(text):
@@ -106,7 +130,7 @@ def _word_stems(note):
     """
     found = []
     for word in _norm(note).split():
-        if len(word) >= MIN_WORD:
+        if len(word) >= MIN_WORD and word not in STOP_WORDS:
             stem = word[:-2] if len(word) > 6 else word  # грубо срезаем окончание
             if stem not in found:
                 found.append(stem)
@@ -179,7 +203,7 @@ def upcoming(start, days=LOOKAHEAD_DAYS):
                 pages[link["url"]] = schedule.fetch_timetable(link["url"])
             found = schedule.extract_day(pages[link["url"]], day)
             if found:
-                result.append((day, found[2]))
+                result.append((day, schedule.drop_day_off(found[2])))
                 break
     return result
 
@@ -263,15 +287,24 @@ def _prune(items, today):
 
 def catch(text, update_id, author, today=None):
     """
-    Обработать сообщение с «дз!».
+    Обработать сообщение с «дз!» или «!дз».
 
-    Возвращает строку-ответ в чат либо None, если маркера в сообщении нет.
+    Возвращает строку-ответ в чат либо None — тогда бот молчит.
+
+    Молчит бот, если маркера нет, и ещё если маркер стоит посреди фразы,
+    а предмет не узнан: «кто сделал дз! ура» — это болтовня, а не запись,
+    и отвечать на неё списком предметов было бы навязчиво. Если же
+    сообщение НАЧИНАЕТСЯ с маркера, человек явно хотел записать дз, и
+    тогда бот подскажет, как написать правильно.
     """
-    note = note_from(text)
-    if note is None:
+    found = find_marker(text)
+    if found is None:
         return None
+    note, at_start = found
     if not note:
-        return "После «дз!» напиши, по какому предмету. Например: дз! матеша §5"
+        if not at_start:
+            return None
+        return "После «!дз» напиши, по какому предмету. Например: !дз физра справка"
 
     today = today or datetime.now(_tz()).date()
     days = upcoming(today + timedelta(days=1))
@@ -307,13 +340,20 @@ def catch(text, update_id, author, today=None):
             save(items, sha)
         except Exception as exc:
             # хранилище не настроено или GitHub не ответил — честно говорим
-            # об этом, а не делаем вид, что записали
+            # об этом в чат, а точную причину отправляем владельцу в личку
             print("дз: не смог сохранить: %s" % exc)
-            return ("Понял, что это про «%s» на %s, но записать не смог — "
-                    "хранилище недоступно. Скажи владельцу бота."
+            _tell_owner("❌ Не смог записать дз в homework.json:\n%s: %s\n\n"
+                        "Проверь GITHUB_TOKEN в Vercel: доступ к репозиторию "
+                        "raspisanie-bot, Contents: Read and write, после "
+                        "добавления — Redeploy." % (type(exc).__name__, exc))
+            return ("Понял, что это про «%s» на %s, но записать не смог. "
+                    "Подробности отправил владельцу бота."
                     % (subject, day.strftime("%d.%m")))
         return "✍️ Записал: %s, %s. Напомню вечером накануне." % (
             subject, day.strftime("%d.%m"))
+
+    if not at_start:
+        return None  # маркер посреди болтовни, предмета нет — молчим
 
     known = []
     for day, lessons in days[:6]:
@@ -324,7 +364,16 @@ def catch(text, update_id, author, today=None):
     hint = "\n".join("• " + name for name in known[:8])
     example = known[0].split()[0].lower() if known else "матеша"
     return ("Не понял, по какому предмету. Вот что есть в ближайшие дни:\n%s\n\n"
-            "Напиши название предмета, например: дз! %s конспект" % (hint, example))
+            "Напиши название предмета, например: !дз %s конспект" % (hint, example))
+
+
+def _tell_owner(text):
+    """Написать владельцу в личку. Сам при этом падать не имеет права."""
+    try:
+        import bot
+        bot.send(text, bot.env("OWNER_ID"))
+    except Exception as exc:
+        print("дз: не смог написать владельцу: %s" % exc)
 
 
 def block_for(day):

@@ -150,7 +150,8 @@ def env_report():
     в одном проекте Vercel, а работает другой), просто открыв адрес в браузере.
     """
     return {name: bool((os.environ.get(name) or "").strip())
-            for name in ("BOT_TOKEN", "CHAT_ID", "OWNER_ID", "WEBHOOK_SECRET")}
+            for name in ("BOT_TOKEN", "CHAT_ID", "OWNER_ID", "WEBHOOK_SECRET",
+                         "GITHUB_TOKEN")}
 
 
 def app(environ, start_response):
