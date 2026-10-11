@@ -90,18 +90,32 @@ def handle_update(update):
     Vercel, чтобы потом было видно, что бот сделал и почему.
     """
     update_id = update.get("update_id")
+    # свои — группа и личка владельца; из остальных чатов молчим
+    allowed = {bot.env("CHAT_ID"), bot.env("OWNER_ID")}
+
+    # Нажатие на кнопку под сообщением бота — отдельный тип апдейта.
+    # Приходит, только если в setWebhook разрешён "callback_query".
+    callback = update.get("callback_query")
+    if callback:
+        chat_id = str(((callback.get("message") or {}).get("chat") or {})
+                      .get("id", ""))
+        if chat_id not in allowed:
+            return "#%s: кнопка из чужого чата %s, игнор" % (update_id, chat_id)
+        if update_id in seen_ids():
+            return "#%s: повтор, уже отвечали" % update_id
+        note = homework.on_callback(callback)
+        remember(update_id)
+        return "#%s: %s" % (update_id, note or "кнопка не наша")
+
     message = (update.get("message") or update.get("edited_message")
                or update.get("channel_post") or {})
     chat_id = str((message.get("chat") or {}).get("id", ""))
 
     parsed = bot.parse_command(message, bot_username())
-    text_in = message.get("text") or message.get("caption") or ""
-    is_homework = parsed is None and homework.note_from(text_in) is not None
+    is_homework = parsed is None and homework.wants(message, bot_username())
     if parsed is None and not is_homework:
         return "#%s: не команда, игнор" % update_id
 
-    # свои — группа и личка владельца; из остальных чатов молчим
-    allowed = {bot.env("CHAT_ID"), bot.env("OWNER_ID")}
     if chat_id not in allowed:
         return "#%s: сообщение из чужого чата %s, игнор" % (update_id, chat_id)
 
@@ -109,14 +123,11 @@ def handle_update(update):
         return "#%s: повтор, уже отвечали" % update_id
 
     if is_homework:
-        author = ((message.get("from") or {}).get("first_name") or "").strip()
-        answer = homework.catch(text_in, update_id, author)
-        if not answer:
-            return "#%s: «дз!» без новых записей" % update_id
-        message_id = bot.send(answer, chat_id)
+        # «!дз …» или ответ на вопрос бота «по какому предмету»:
+        # homework сам отвечает в чат, нам остаётся записать в лог
+        note = homework.on_message(message, update_id, bot_username())
         remember(update_id)
-        return "#%s: дз -> ответил в %s, message_id=%s, %s" % (
-            update_id, chat_id, message_id, answer.split("\n")[0])
+        return note or "#%s: про дз, но отвечать нечего" % update_id
 
     command, arg = parsed
 

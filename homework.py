@@ -399,6 +399,18 @@ def upcoming(start, days=LOOKAHEAD_DAYS):
 # --------------------------------------------------------------------------
 # Хранилище
 # --------------------------------------------------------------------------
+#
+# homework.json:
+#   {"items":   [записи о дз],
+#    "pending": [дз со сроком, по которым бот спросил предмет и ждёт ответа]}
+
+PENDING_HOURS = 24      # сколько ждём ответа «по какому предмету»
+
+SKIP = object()         # change(): «менять нечего, не записывай»
+
+
+class Conflict(Exception):
+    """Файл на GitHub успели поменять, пока мы его правили."""
 
 
 def _github():
@@ -408,8 +420,26 @@ def _github():
     return (token, repo) if token else (None, repo)
 
 
-def load():
-    """(список записей, sha файла на GitHub или None). Пусто, если файла нет."""
+def _doc(raw):
+    """Разобрать homework.json, переживая пустой, битый и старый формат."""
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {}
+    if isinstance(data, list):          # совсем старый формат — просто список
+        data = {"items": data}
+    if not isinstance(data, dict):
+        data = {}
+    items, pending = data.get("items"), data.get("pending")
+    return {"items": items if isinstance(items, list) else [],
+            "pending": pending if isinstance(pending, list) else []}
+
+
+def load_doc():
+    """
+    (документ, sha). sha — версия файла на GitHub: по ней GitHub поймёт,
+    если кто-то успел записать раньше нас, и не даст затереть чужую правку.
+    """
     token, repo = _github()
     if token:
         resp = requests.get(
@@ -418,30 +448,27 @@ def load():
                      "Accept": "application/vnd.github+json"},
             timeout=TIMEOUT)
         if resp.status_code == 404:
-            return [], None
+            return _doc(""), None
         resp.raise_for_status()
         payload = resp.json()
         raw = base64.b64decode(payload["content"]).decode("utf-8")
-        return _items(raw), payload.get("sha")
+        return _doc(raw), payload.get("sha")
 
     if not os.path.exists(HOMEWORK_FILE):
-        return [], None
+        return _doc(""), None
     with open(HOMEWORK_FILE, "r", encoding="utf-8") as fh:
-        return _items(fh.read()), None
+        return _doc(fh.read()), None
 
 
-def _items(raw):
-    try:
-        data = json.loads(raw or "{}")
-    except ValueError:
-        return []
-    items = data.get("items") if isinstance(data, dict) else data
-    return items if isinstance(items, list) else []
+def load():
+    """(список записей, sha) — для тех, кому вопросы в ожидании не нужны."""
+    doc, sha = load_doc()
+    return doc["items"], sha
 
 
-def save(items, sha=None):
-    """Записать список. На Vercel — коммитом в репозиторий, иначе на диск."""
-    body = json.dumps({"items": items}, ensure_ascii=False, indent=1)
+def save_doc(doc, sha=None, message="дз: запись из чата"):
+    """Записать документ. На Vercel — коммитом в репозиторий, иначе на диск."""
+    body = json.dumps(doc, ensure_ascii=False, indent=1)
     token, repo = _github()
     if not token:
         with open(HOMEWORK_FILE, "w", encoding="utf-8") as fh:
@@ -449,7 +476,7 @@ def save(items, sha=None):
         return
 
     data = {
-        "message": "дз: запись из чата [skip ci]",
+        "message": message + " [skip ci]",
         "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
     }
     if sha:
@@ -459,15 +486,47 @@ def save(items, sha=None):
         headers={"Authorization": "Bearer %s" % token,
                  "Accept": "application/vnd.github+json"},
         json=data, timeout=TIMEOUT)
+    if resp.status_code in (409, 422):
+        raise Conflict("GitHub: файл успели поменять (HTTP %s)" % resp.status_code)
     if resp.status_code not in (200, 201):
         raise RuntimeError("GitHub не принял homework.json: HTTP %s %s"
                            % (resp.status_code, resp.text[:200]))
 
 
-def _prune(items, today):
-    """Выбросить записи, у которых день давно прошёл."""
+def change(mutate, message="дз: запись из чата"):
+    """
+    Прочитать homework.json, поправить функцией mutate(doc), записать.
+
+    mutate возвращает результат — его и вернёт change(). Вернула SKIP —
+    менять нечего, писать не будем. Если, пока мы правили, файл кто-то
+    поменял (два человека написали дз в одну секунду), GitHub откажет —
+    тогда перечитываем свежую версию и пробуем ещё раз.
+    """
+    last = None
+    for _ in range(3):
+        doc, sha = load_doc()
+        _prune(doc)
+        result = mutate(doc)
+        if result is SKIP:
+            return SKIP
+        try:
+            save_doc(doc, sha, message)
+            return result
+        except Conflict as exc:
+            last = exc
+    raise last
+
+
+def _prune(doc, today=None):
+    """Выбросить давно прошедшие дз и вопросы, на которые так и не ответили."""
+    today = today or _today()
     edge = (today - timedelta(days=KEEP_DAYS)).isoformat()
-    return [i for i in items if str(i.get("for_date", "")) >= edge]
+    doc["items"] = [i for i in doc["items"]
+                    if str(i.get("for_date", "")) >= edge]
+    fresh = (datetime.now(_tz()) - timedelta(hours=PENDING_HOURS)).strftime(
+        "%Y-%m-%d %H:%M")
+    doc["pending"] = [p for p in doc["pending"]
+                      if str(p.get("created", "")) >= fresh]
 
 
 def _date(item):
@@ -481,36 +540,108 @@ def _kind(item):
     return item.get("kind") or LESSON  # у старых записей поля нет
 
 
+def _now():
+    return datetime.now(_tz()).strftime("%Y-%m-%d %H:%M")
+
+
+def _today():
+    return datetime.now(_tz()).date()
+
+
+def _new_item(item_id, author, subject, note, day, kind):
+    return {"id": item_id, "kind": kind, "subject": subject, "note": note,
+            "author": author, "for_date": day.isoformat(), "added": _now()}
+
+
+def _storage_failed(exc, what):
+    """Сказать в чат коротко, а владельцу в личку — точную причину."""
+    print("дз: не смог сохранить: %s" % exc)
+    _tell_owner("❌ Не смог записать дз в homework.json:\n%s: %s\n\n"
+                "Проверь GITHUB_TOKEN в Vercel: доступ к репозиторию "
+                "raspisanie-bot, Contents: Read and write, после "
+                "добавления — Redeploy." % (type(exc).__name__, exc))
+    return ("Понял %s, но записать не смог. Подробности отправил владельцу бота."
+            % what)
+
+
 # --------------------------------------------------------------------------
-# Что вызывает вебхук: запись нового дз
+# Что вызывает вебхук
 # --------------------------------------------------------------------------
+#
+# on_message() — сообщение в чате; on_callback() — нажатие на кнопку.
+# Оба сами отвечают в Telegram и возвращают строку для лога Vercel
+# (или None, если сообщение было не про дз).
 
 
-def catch(text, update_id, author, today=None):
+def wants(message, username):
     """
-    Обработать сообщение с «!дз».
-
-    Возвращает строку-ответ в чат либо None — тогда бот молчит.
-
-    Молчит бот, если маркера нет, и ещё если маркер стоит посреди фразы,
-    а записать нечего: «кто сделал дз! ура» — это болтовня, а не запись,
-    и отвечать на неё списком предметов было бы навязчиво. Если же
-    сообщение НАЧИНАЕТСЯ с маркера, человек явно хотел записать дз, и
-    тогда бот подскажет, как написать правильно.
+    Стоит ли вообще отдавать сообщение в on_message. Проверка дешёвая, без
+    чтения homework.json: в нём «!дз» или это ответ на сообщение бота
+    (вдруг человек отвечает, по какому предмету его дз).
     """
-    found = find_marker(text)
-    if found is None:
+    text = message.get("text") or message.get("caption") or ""
+    return find_marker(text) is not None or _reply_to_us(message, username)
+
+
+def _reply_to_us(message, username):
+    sender = (message.get("reply_to_message") or {}).get("from") or {}
+    return bool(sender.get("is_bot")) and (
+        not username or (sender.get("username") or "").lower() == username)
+
+
+def on_message(message, update_id, username=None):
+    text = message.get("text") or message.get("caption") or ""
+    if find_marker(text) is None:
+        if _reply_to_us(message, username):
+            return _subject_answer(message)
         return None
-    note, at_start = found
+    return _catch(message, update_id)
+
+
+DELETE_WORDS = ("удалить", "удали", "удаление", "убрать", "убери",
+                "стереть", "сотри")
+
+
+def _catch(message, update_id, today=None):
+    """
+    Сообщение с «!дз»: записать, спросить предмет или открыть удаление.
+
+    Молчит бот, если маркер стоит посреди фразы, а записать нечего:
+    «кто сделал дз! ура» — это болтовня, а не запись, и отвечать на неё
+    списком предметов было бы навязчиво. Если же сообщение НАЧИНАЕТСЯ
+    с маркера, человек явно хотел записать дз, и тогда бот подскажет,
+    как написать правильно.
+    """
+    import bot
+
+    text = message.get("text") or message.get("caption") or ""
+    note, at_start = find_marker(text)
+    chat_id = (message.get("chat") or {}).get("id")
+    reply_to = message.get("message_id")
+    sender = message.get("from") or {}
+    author = (sender.get("first_name") or "").strip()
+
+    def say(answer, markup=None):
+        mid = bot.send(answer, chat_id, reply_markup=markup, reply_to=reply_to)
+        return "#%s: дз -> %s (message_id=%s)" % (
+            update_id, answer.split("\n")[0], mid)
+
     if not note:
         if not at_start:
             return None
-        return "После «!дз» напиши предмет и что задали. Например: !дз уфис конспект"
+        return say("После «!дз» напиши предмет и что задали. "
+                   "Например: !дз уфис конспект")
 
-    today = today or datetime.now(_tz()).date()
+    first = _norm(note).split()[0] if _norm(note) else ""
+    if at_start and first in DELETE_WORDS:
+        query = note.split(None, 1)[1] if len(note.split(None, 1)) > 1 else ""
+        return _delete_menu(chat_id, reply_to, sender.get("id"), query,
+                            update_id)
+
+    today = today or _today()
     deadline, note, error = parse_deadline(note, today)
     if error:
-        return error if at_start else None
+        return say(error) if at_start else None
 
     days = upcoming(today + timedelta(days=1))
     live = []                                      # предметы в порядке появления
@@ -524,66 +655,382 @@ def catch(text, update_id, author, today=None):
         # со сроком предмет не обязан стоять в ближайших днях — ищем среди всех
         names = live + [n for n in SUBJECTS if n not in live]
         subject = best_subject(note, names, order=live)
-        return _store(update_id, author, today, subject, note, deadline,
-                      DEADLINE)
+        if subject is None:
+            return _ask_subject(message, update_id, note, deadline)
+        return say(_record(update_id, author, subject, note, deadline, DEADLINE))
 
     subject = best_subject(note, live, order=live)
     if subject:
         for day, lessons in days:
             if any(subject_of(l["text"]) == subject for l in lessons):
-                return _store(update_id, author, today, subject, note, day,
-                              LESSON)
+                return say(_record(update_id, author, subject, note, day, LESSON))
 
     if not at_start:
         return None  # маркер посреди болтовни, предмета нет — молчим
 
     hint = "\n".join("• " + name for name in live[:9])
-    return ("Не понял, по какому предмету. Вот что есть в ближайшие дни:\n%s\n\n"
-            "Можно писать сокращением: !дз уфис конспект\n"
-            "А если есть срок: !дз уфис курсовая до 15.12" % hint)
+    return say("Не понял, по какому предмету. Вот что есть в ближайшие дни:\n%s\n\n"
+               "Можно писать сокращением: !дз уфис конспект\n"
+               "А если есть срок: !дз уфис курсовая до 15.12" % hint)
 
 
-def _store(update_id, author, today, subject, note, day, kind):
-    """Сохранить запись и вернуть ответ в чат."""
+def _record(item_id, author, subject, note, day, kind):
+    """Сохранить запись и вернуть текст ответа в чат."""
+    item = _new_item(item_id, author, subject, note, day, kind)
+
+    def add(doc):
+        if any(i.get("id") == item_id for i in doc["items"]):
+            return SKIP                    # этот же апдейт уже записан
+        doc["items"].append(item)
+        return True
+
     try:
-        items, sha = load()
-        items = _prune(items, today)
-        if any(i.get("id") == update_id for i in items):
-            return None  # этот же апдейт уже записан
-        items.append({
-            "id": update_id,
-            "kind": kind,
-            "subject": subject,
-            "note": note,
-            "author": author,
-            "for_date": day.isoformat(),
-            "added": datetime.now(_tz()).strftime("%Y-%m-%d %H:%M"),
-        })
-        save(items, sha)
+        change(add)
     except Exception as exc:
-        # хранилище не настроено или GitHub не ответил — честно говорим
-        # об этом в чат, а точную причину отправляем владельцу в личку
-        print("дз: не смог сохранить: %s" % exc)
-        _tell_owner("❌ Не смог записать дз в homework.json:\n%s: %s\n\n"
-                    "Проверь GITHUB_TOKEN в Vercel: доступ к репозиторию "
-                    "raspisanie-bot, Contents: Read and write, после "
-                    "добавления — Redeploy." % (type(exc).__name__, exc))
-        return ("Понял, что это про «%s» на %s, но записать не смог. "
-                "Подробности отправил владельцу бота."
-                % (subject or "дз", day.strftime("%d.%m")))
+        return _storage_failed(exc, "дз про «%s» на %s"
+                               % (subject or "дз", day.strftime("%d.%m")))
+    return _recorded_text(item)
 
-    title = subject or "без предмета"
-    if kind == LESSON:
+
+def _recorded_text(item):
+    day = _date(item)
+    title = item.get("subject") or "без предмета"
+    if _kind(item) == LESSON:
         return "✍️ Записал: %s, %s. Напомню вечером накануне." % (
             title, day.strftime("%d.%m"))
-
     start = day - timedelta(days=REMIND_BEFORE)
-    if start <= today:
+    if start <= _today():
         when = "Буду напоминать в расписании каждый день до срока."
     else:
         when = "Начну напоминать в расписании с %s." % start.strftime("%d.%m")
-    return "✍️ Записал: %s, срок %s %s. %s" % (
-        title, WEEKDAYS[day.weekday()], day.strftime("%d.%m"), when)
+    return "✍️ Записал: %s, срок %s. %s" % (title, _stamp(day), when)
+
+
+def _stamp(day):
+    return "%s %s" % (WEEKDAYS[day.weekday()], day.strftime("%d.%m"))
+
+
+# --------------------------------------------------------------------------
+# «По какому предмету-то дз?» — для дз со сроком, где предмет не узнан
+# --------------------------------------------------------------------------
+
+
+def _ask_subject(message, update_id, note, deadline):
+    """
+    Задать вопрос с двумя кнопками и запомнить дз «в ожидании».
+
+    Ключ ожидания — update_id исходного сообщения: он уникален и влезает
+    в callback_data кнопки (там лимит 64 байта).
+    """
+    import bot
+
+    chat_id = (message.get("chat") or {}).get("id")
+    sender = message.get("from") or {}
+    keyboard = {"inline_keyboard": [[
+        {"text": "Нет предмета", "callback_data": "hw:none:%s" % update_id},
+        {"text": "Сейчас напишу", "callback_data": "hw:wait:%s" % update_id},
+    ]]}
+    question = bot.send(
+        "По какому предмету-то дз?\n«%s», срок %s" % (note, _stamp(deadline)),
+        chat_id, reply_markup=keyboard, reply_to=message.get("message_id"))
+
+    pending = {
+        "id": update_id,
+        "chat_id": chat_id,
+        "user_id": sender.get("id"),
+        "author": (sender.get("first_name") or "").strip(),
+        "message_id": message.get("message_id"),
+        "msg_ids": [question],         # ответ на любое из них — это предмет
+        "note": note,
+        "for_date": deadline.isoformat(),
+        "created": _now(),
+    }
+
+    def add(doc):
+        doc["pending"] = [p for p in doc["pending"] if p.get("id") != update_id]
+        doc["pending"].append(pending)
+        return True
+
+    try:
+        change(add, "дз: ждём предмет")
+    except Exception as exc:
+        bot.call("editMessageText", chat_id=chat_id, message_id=question,
+                 text=_storage_failed(exc, "дз со сроком %s" % _stamp(deadline)))
+        return "#%s: дз -> вопрос задан, но не сохранён" % update_id
+    return "#%s: дз -> спросил предмет (message_id=%s)" % (update_id, question)
+
+
+def _subject_answer(message):
+    """Человек ответил на вопрос бота названием предмета — записываем дз."""
+    import bot
+
+    chat_id = (message.get("chat") or {}).get("id")
+    answered = (message.get("reply_to_message") or {}).get("message_id")
+    user_id = (message.get("from") or {}).get("id")
+    text = (message.get("text") or "").strip()
+    if not text:
+        return None
+    found = {}
+
+    def resolve(doc):
+        for p in doc["pending"]:
+            if answered in (p.get("msg_ids") or []) and \
+                    str(p.get("chat_id")) == str(chat_id):
+                if p.get("user_id") != user_id:
+                    return SKIP            # отвечает не тот, чьё это дз
+                subject = best_subject(text, list(SUBJECTS)) or _as_subject(text)
+                item = _new_item(p["id"], p.get("author"), subject,
+                                 p.get("note"), date.fromisoformat(p["for_date"]),
+                                 DEADLINE)
+                doc["pending"].remove(p)
+                if not any(i.get("id") == p["id"] for i in doc["items"]):
+                    doc["items"].append(item)
+                found.update(item=item, question=p["msg_ids"][0])
+                return True
+        return SKIP                        # это ответ боту, но не на вопрос
+
+    try:
+        result = change(resolve)
+    except Exception as exc:
+        bot.send(_storage_failed(exc, "предмет"), chat_id,
+                 reply_to=message.get("message_id"))
+        return "дз: ответ с предметом не сохранён"
+    if result is SKIP:
+        return None
+
+    _drop_buttons(chat_id, found["question"])
+    answer = _recorded_text(found["item"])
+    bot.send(answer, chat_id, reply_to=message.get("message_id"))
+    return "дз: предмет получен -> %s" % answer
+
+
+def _as_subject(text):
+    """Неизвестный предмет: берём как написали, с большой буквы."""
+    text = re.sub(r"\s+", " ", text).strip(" .,!?")[:60]
+    return text[:1].upper() + text[1:]
+
+
+# --------------------------------------------------------------------------
+# «!дз удалить»
+# --------------------------------------------------------------------------
+
+
+def _short_subject(name):
+    """Короткое имя для кнопки: длинные названия — сокращением (УФИС, ПОПД)."""
+    if not name:
+        return "без предмета"
+    if len(name) <= 22:
+        return name
+    words = [w for w in re.split(r"[^а-яёa-z0-9]+", name.lower())
+             if w and w not in SMALL_WORDS]
+    return "".join(w[0] for w in words).upper()
+
+
+def _button_text(item):
+    note = str(item.get("note") or "").strip()
+    text = "%s %s — %s" % (_date(item).strftime("%d.%m"),
+                           _short_subject(item.get("subject")), note)
+    return "❌ " + (text if len(text) <= 48 else text[:47] + "…")
+
+
+def _delete_menu(chat_id, reply_to, user_id, query, update_id):
+    """Показать дз кнопками — нажатая будет удалена."""
+    import bot
+
+    items = [i for i in load()[0] if _date(i) and _date(i) >= _today()]
+    items.sort(key=_date)
+    title = "Какое дз удалить? Нажми на него:"
+    if query and items:
+        names = []
+        for i in items:
+            if i.get("subject") and i["subject"] not in names:
+                names.append(i["subject"])
+        subject = best_subject(query, names)
+        if subject:
+            items = [i for i in items if i.get("subject") == subject]
+        else:
+            title = "Не нашёл дз по «%s». Вот все — какое удалить?" % query
+
+    if not items:
+        mid = bot.send("Записанных дз нет — удалять нечего.", chat_id,
+                       reply_to=reply_to)
+        return "#%s: дз удалить -> пусто (message_id=%s)" % (update_id, mid)
+
+    rows = [[{"text": _button_text(i),
+              "callback_data": "hw:del:%s:%s" % (i["id"], user_id)}]
+            for i in items[:15]]
+    rows.append([{"text": "Отмена", "callback_data": "hw:cancel:0:%s" % user_id}])
+    mid = bot.send(title, chat_id, reply_markup={"inline_keyboard": rows},
+                   reply_to=reply_to)
+    return "#%s: дз удалить -> меню из %d (message_id=%s)" % (
+        update_id, len(items), mid)
+
+
+# --------------------------------------------------------------------------
+# Нажатия на кнопки
+# --------------------------------------------------------------------------
+
+
+def on_callback(cb):
+    """
+    Обработать нажатие. Кнопки бывают:
+      hw:none:<id>              «Нет предмета»
+      hw:wait:<id>              «Сейчас напишу»
+      hw:del:<id>:<кто открыл>  удалить дз
+      hw:cancel:0:<кто открыл>  отмена удаления
+    """
+    parts = (cb.get("data") or "").split(":")
+    if len(parts) < 3 or parts[0] != "hw":
+        return None                        # не наша кнопка
+    action = parts[1]
+    try:
+        key = int(parts[2])
+        owner = int(parts[3]) if len(parts) > 3 else None
+    except ValueError:
+        return None
+    user_id = (cb.get("from") or {}).get("id")
+    msg = cb.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+
+    if action in ("del", "cancel") and owner is not None and user_id != owner:
+        _toast(cb, "Это меню открыл другой человек 🙂")
+        return "кнопка %s: нажал не тот" % action
+    if action == "cancel":
+        _edit(chat_id, message_id, "Ок, ничего не удаляю.")
+        _toast(cb, "")
+        return "кнопка: отмена удаления"
+    if action == "del":
+        return _press_delete(cb, key, chat_id, message_id)
+    if action in ("none", "wait"):
+        return _press_subject(cb, action, key, user_id, chat_id, message_id)
+    return None
+
+
+def _press_delete(cb, item_id, chat_id, message_id):
+    found = {}
+
+    def remove(doc):
+        for item in doc["items"]:
+            if item.get("id") == item_id:
+                doc["items"].remove(item)
+                found["item"] = item
+                return True
+        return SKIP
+
+    try:
+        result = change(remove, "дз: удалено из чата")
+    except Exception as exc:
+        _toast(cb, "Не смог удалить, подробности у владельца")
+        _storage_failed(exc, "удаление")
+        return "кнопка удалить: ошибка хранилища"
+    if result is SKIP:
+        _edit(chat_id, message_id, "Это дз уже удалено.")
+        _toast(cb, "Уже удалено")
+        return "кнопка удалить: уже нет"
+    item = found["item"]
+    when = _date(item).strftime("%d.%m")
+    _edit(chat_id, message_id, "🗑 Удалил (%s):\n%s" % (when, _line(item)))
+    _toast(cb, "Удалил")
+    return "кнопка удалить: %s" % item_id
+
+
+def _press_subject(cb, action, key, user_id, chat_id, message_id):
+    import bot
+
+    state = {}
+
+    def check(doc):
+        for p in doc["pending"]:
+            if p.get("id") == key:
+                if p.get("user_id") != user_id:
+                    state["why"] = "stranger"
+                    return SKIP
+                state["p"] = dict(p)
+                if action == "none":
+                    item = _new_item(key, p.get("author"), None, p.get("note"),
+                                     date.fromisoformat(p["for_date"]), DEADLINE)
+                    doc["pending"].remove(p)
+                    if not any(i.get("id") == key for i in doc["items"]):
+                        doc["items"].append(item)
+                    state["item"] = item
+                    return True
+                return SKIP                # «Сейчас напишу»: пока ничего не меняем
+        state["why"] = "gone"
+        return SKIP
+
+    try:
+        change(check)
+    except Exception as exc:
+        _toast(cb, "Не смог записать, подробности у владельца")
+        _storage_failed(exc, "дз без предмета")
+        return "кнопка %s: ошибка хранилища" % action
+
+    if state.get("why") == "stranger":
+        _toast(cb, "Это вопрос не тебе 🙂")
+        return "кнопка %s: нажал не автор" % action
+    if state.get("why") == "gone":
+        _drop_buttons(chat_id, message_id)
+        _toast(cb, "Уже неактуально")
+        return "кнопка %s: вопрос уже закрыт" % action
+
+    if action == "none":
+        _edit(chat_id, message_id, _recorded_text(state["item"]))
+        _toast(cb, "Записал")
+        return "кнопка: записал без предмета"
+
+    # «Сейчас напишу»: шлём сообщение, на которое Telegram сразу откроет
+    # ответ у автора (force_reply), и запоминаем его как ещё один вопрос
+    p = state["p"]
+    prompt = bot.send("Напиши предмет ответом на это сообщение 👇", chat_id,
+                      reply_markup={"force_reply": True, "selective": True,
+                                    "input_field_placeholder": "например, уфис"},
+                      reply_to=p.get("message_id"))
+
+    def remember_prompt(doc):
+        for q in doc["pending"]:
+            if q.get("id") == key:
+                q["msg_ids"] = list(q.get("msg_ids") or []) + [prompt]
+                return True
+        return SKIP
+
+    try:
+        change(remember_prompt, "дз: ждём предмет")
+    except Exception as exc:
+        _storage_failed(exc, "ожидание предмета")
+    _edit(chat_id, message_id, "По какому предмету-то дз?\n«%s», срок %s\n\n"
+          "Жду ответ 👇" % (p.get("note"), _stamp(date.fromisoformat(p["for_date"]))))
+    _toast(cb, "")
+    return "кнопка: ждём предмет (prompt=%s)" % prompt
+
+
+def _toast(cb, text):
+    """Ответить на нажатие — иначе у человека будут крутиться часики."""
+    try:
+        import bot
+        bot.call("answerCallbackQuery", callback_query_id=cb.get("id"),
+                 text=text or None)
+    except Exception as exc:
+        print("дз: answerCallbackQuery: %s" % exc)
+
+
+def _edit(chat_id, message_id, text):
+    """Поменять текст сообщения; кнопки при этом исчезают."""
+    try:
+        import bot
+        bot.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                 text=text)
+    except Exception as exc:
+        print("дз: editMessageText: %s" % exc)
+
+
+def _drop_buttons(chat_id, message_id):
+    try:
+        import bot
+        bot.call("editMessageReplyMarkup", chat_id=chat_id,
+                 message_id=message_id)
+    except Exception as exc:            # «message is not modified» и т.п.
+        print("дз: editMessageReplyMarkup: %s" % exc)
 
 
 # --------------------------------------------------------------------------

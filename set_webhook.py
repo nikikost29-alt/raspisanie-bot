@@ -9,10 +9,19 @@
     python set_webhook.py --info      # только показать, что сейчас настроено
     python set_webhook.py --dry URL   # показать, что будет сделано, и выйти
     python set_webhook.py --commands  # обновить меню команд бота в Telegram
+    python set_webhook.py --drop-pending URL  # плюс выбросить очередь
 
-drop_pending_updates=true ставится намеренно: пока вебхука не было, в очереди
-Telegram копились сообщения, и без этого бот ответил бы разом на все.
+Боту разрешены два вида событий: сообщения и нажатия на кнопки под его
+сообщениями (callback_query). Без второго кнопки «Нет предмета» и
+«❌ удалить» будут нажиматься, но до бота не дойдут.
+
+--drop-pending нужен только при самой первой настройке: пока вебхука не было,
+в очереди Telegram копились сообщения, и без него бот ответил бы разом на все.
+При повторной настройке очередь пуста — сбрасывать её незачем, а то можно
+потерять сообщение, отправленное в ту же секунду.
 """
+
+ALLOWED_UPDATES = '["message", "callback_query"]'
 
 import sys
 
@@ -91,6 +100,9 @@ def main(argv):
     print("  secret_token = %s… (%d символов, из .env.local)"
           % (secret[:4], len(secret)))
     print("  токен бота взят из .env.local, в ссылке его печатать не нужно")
+    print("  события      = %s" % ALLOWED_UPDATES)
+    print("  очередь      = %s" % ("выбросить" if "--drop-pending" in argv
+                                   else "сохранить"))
 
     if dry:
         print("\n--dry: ничего не отправлено")
@@ -100,8 +112,8 @@ def main(argv):
         "setWebhook",
         url=url,
         secret_token=secret,
-        allowed_updates='["message"]',
-        drop_pending_updates="true",
+        allowed_updates=ALLOWED_UPDATES,
+        drop_pending_updates="true" if "--drop-pending" in argv else "false",
     )
     print("\nответ Telegram:", result)
     if not result.get("ok"):
@@ -110,7 +122,7 @@ def main(argv):
     print()
     info = show_info()
     if info.get("url") == url:
-        print("\nГотово. Пиши /raspisanie в группе.")
+        print("\nГотово. Пиши /today в группе.")
         return 0
     print("\nАдрес в getWebhookInfo не совпал с тем, что ставили.", file=sys.stderr)
     return 1

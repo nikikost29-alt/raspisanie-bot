@@ -227,11 +227,16 @@ def not_published_message(day, words=TOMORROW):
 # Отправка
 # --------------------------------------------------------------------------
 
-def send(text, chat_id):
-    """Отправить сообщение в Telegram. Возвращает message_id."""
+def call(method, **params):
+    """
+    Вызвать метод Telegram Bot API и вернуть его result.
+
+    Параметры уходят JSON-телом, поэтому кнопки (reply_markup) можно
+    передавать обычным словарём.
+    """
     resp = requests.post(
-        TELEGRAM_API % env("BOT_TOKEN"),
-        data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        "https://api.telegram.org/bot%s/%s" % (env("BOT_TOKEN"), method),
+        json={k: v for k, v in params.items() if v is not None},
         timeout=TIMEOUT,
     )
     try:
@@ -240,9 +245,26 @@ def send(text, chat_id):
         raise BotError("Telegram ответил не-JSON: HTTP %s" % resp.status_code)
     if not payload.get("ok"):
         raise BotError(
-            "Telegram отказал: %s" % payload.get("description", resp.status_code)
+            "Telegram отказал (%s): %s"
+            % (method, payload.get("description", resp.status_code))
         )
-    return payload["result"]["message_id"]
+    return payload.get("result")
+
+
+def send(text, chat_id, reply_markup=None, reply_to=None):
+    """
+    Отправить сообщение в Telegram. Возвращает message_id.
+
+    reply_markup — кнопки под сообщением; reply_to — message_id сообщения,
+    на которое отвечаем (если его успели удалить, сообщение всё равно уйдёт).
+    """
+    reply = None
+    if reply_to:
+        reply = {"message_id": reply_to, "allow_sending_without_reply": True}
+    result = call("sendMessage", chat_id=chat_id, text=text,
+                  disable_web_page_preview=True, reply_markup=reply_markup,
+                  reply_parameters=reply)
+    return result["message_id"]
 
 
 # --------------------------------------------------------------------------
