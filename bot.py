@@ -84,6 +84,10 @@ COMMANDS = ((TODAY_COMMAND, TOMORROW_COMMAND, COMMAND) + HOMEWORK_COMMANDS
             + HELP_COMMANDS)
 SWITCH_HOUR = 19
 
+# Тихие часы по Уфе: сообщения приходят, но телефон не звенит. Касается
+# всех сообщений бота — рассылки, ответов на команды, ошибок владельцу.
+QUIET_FROM, QUIET_TO = 0, 7   # с 00:00 до 07:00
+
 # Подписи "за какую дату": (слово в шапке, слово в предупреждении)
 TOMORROW = ("ЗАВТРА", "на завтра")
 TODAY = ("СЕГОДНЯ", "на сегодня")
@@ -272,19 +276,27 @@ def call(method, **params):
     return payload.get("result")
 
 
+def quiet_now(now=None):
+    """Тихие ли сейчас часы (QUIET_FROM..QUIET_TO по Уфе)."""
+    hour = (now or datetime.now(YEKB)).hour
+    return QUIET_FROM <= hour < QUIET_TO
+
+
 def send(text, chat_id, reply_markup=None, reply_to=None):
     """
     Отправить сообщение в Telegram. Возвращает message_id.
 
     reply_markup — кнопки под сообщением; reply_to — message_id сообщения,
     на которое отвечаем (если его успели удалить, сообщение всё равно уйдёт).
+    Ночью (см. QUIET_FROM/QUIET_TO) сообщение уходит без звука.
     """
     reply = None
     if reply_to:
         reply = {"message_id": reply_to, "allow_sending_without_reply": True}
     result = call("sendMessage", chat_id=chat_id, text=text,
                   disable_web_page_preview=True, reply_markup=reply_markup,
-                  reply_parameters=reply)
+                  reply_parameters=reply,
+                  disable_notification=True if quiet_now() else None)
     return result["message_id"]
 
 
