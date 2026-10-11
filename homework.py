@@ -1193,6 +1193,26 @@ def block_for(day):
     return "\n".join(lines)
 
 
+def abbreviations():
+    """
+    [(сокращение, предмет)] для /help — по одному на предмет из SUBJECTS.
+
+    Берём первые буквы полного названия (без «и», «о»…), а если название
+    из одного слова (Стандартизация) — из первого длинного синонима.
+    """
+    out = []
+    for name, aliases in SUBJECTS.items():
+        for phrase in [name] + list(aliases):
+            words = [w for w in re.split(r"[^а-яёa-z0-9]+", phrase.lower())
+                     if w and w not in SMALL_WORDS]
+            if len(words) >= 2 and (phrase == name or len(words) >= 3):
+                out.append(("".join(w[0] for w in words), name))
+                break
+        else:
+            out.append((name.lower(), name))
+    return out
+
+
 def summary(start):
     """
     Ответ на /dz: дз на ближайшую дату, когда оно вообще есть, начиная со

@@ -131,6 +131,13 @@ def handle_update(update):
 
     command, arg = parsed
 
+    if command in bot.HELP_COMMANDS:
+        text = bot.help_text()
+        message_id = bot.send(text, chat_id)
+        remember(update_id)
+        return "#%s: %s -> ответил в %s, message_id=%s" % (
+            update_id, command, chat_id, message_id)
+
     if command in bot.HOMEWORK_COMMANDS:
         # с какой даты смотреть дз — как у /raspisanie без аргумента:
         # до 19:00 с сегодняшнего дня, после — с завтрашнего

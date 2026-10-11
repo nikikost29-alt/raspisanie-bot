@@ -55,8 +55,10 @@ DIGITS = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6�
 # явное время в тексте пары: "В 09:00 Тематический кураторский час"
 EXPLICIT_TIME_RE = re.compile(r"(?:^|\s)В\s+(\d{1,2}[:.]\d{2})(?=\s|$)")
 LEADING_TIME_RE = re.compile(r"^В\s+\d{1,2}[:.]\d{2}\s+")
-# "данные на 02.09.2026, 15:36:46" -> дата и часы:минуты
-UPDATED_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})\D+(\d{2}:\d{2})")
+# "данные на 02.09.2026, 15:36:46" -> дата и часы:минуты. Час бывает и
+# из одной цифры ("9:41:34") — раньше такой не распознавался, и в подписи
+# оказывалась сырая строка с сайта в другом виде.
+UPDATED_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})\D+(\d{1,2}):(\d{2})")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local")
@@ -76,7 +78,10 @@ TOMORROW_COMMAND = "/tm"
 # Дз на ближайшую дату. Telegram признаёт командой только латиницу, поэтому
 # в меню — /dz, но и набранное руками «/дз» бот тоже понимает.
 HOMEWORK_COMMANDS = ("/dz", "/дз")
-COMMANDS = (TODAY_COMMAND, TOMORROW_COMMAND, COMMAND) + HOMEWORK_COMMANDS
+# Список всех команд. /start Telegram шлёт сам, когда бота открывают впервые.
+HELP_COMMANDS = ("/help", "/start")
+COMMANDS = ((TODAY_COMMAND, TOMORROW_COMMAND, COMMAND) + HOMEWORK_COMMANDS
+            + HELP_COMMANDS)
 SWITCH_HOUR = 19
 
 # Подписи "за какую дату": (слово в шапке, слово в предупреждении)
@@ -173,8 +178,24 @@ def _footer(updated):
         return None
     m = UPDATED_RE.search(updated)
     if m:
-        return "(данные на сайте: %s %s)" % (m.group(1), m.group(2))
+        return "(данные на сайте: %s %02d:%s)" % (
+            m.group(1), int(m.group(2)), m.group(3))
     return "(%s)" % updated
+
+
+def same_schedule(old, new):
+    """
+    Одинаковы ли пары в двух сообщениях, не считая строки «(данные на сайте…)».
+
+    Эту строку сайт обновляет, когда меняется расписание ЛЮБОЙ группы колледжа.
+    Сравнивай мы сообщения целиком, бот кричал бы «🔄 изменили» на каждое
+    такое обновление: по истории рассылок так вышло 14 раз из 16, а пары
+    ИС-41-23к при этом не менялись.
+    """
+    def core(text):
+        return "\n".join(line for line in (text or "").split("\n")
+                         if not line.startswith("(данные на")).strip()
+    return core(old) == core(new)
 
 
 def format_message(result, day, words=TOMORROW):
@@ -431,8 +452,35 @@ HELP = (
     "/today — на сегодня\n"
     "/tm — на завтра\n"
     "/raspisanie 05.09 — на конкретную дату\n"
-    "/dz — домашние задания"
+    "/dz — домашние задания\n"
+    "/help — всё, что я умею"
 )
+
+
+def help_text():
+    """Ответ на /help: все команды и сокращения предметов из словаря."""
+    lines = [
+        "📖 Что я умею",
+        "",
+        "📅 Расписание",
+        "/today — на сегодня",
+        "/tm — на завтра",
+        "/raspisanie 05.09 — на любую дату",
+        "Каждый вечер сам присылаю расписание на завтра.",
+        "",
+        "📝 Домашние задания",
+        "!дз уфис конспект — записать к ближайшей паре предмета",
+        "!дз уфис курсовая до 15.12 — со сроком, напомню за неделю",
+        "/dz — дз на ближайшую дату, когда оно есть",
+        "!дз удалить — удалить запись (можно: !дз удалить уфис)",
+        "Если не узнаю предмет — спрошу кнопками.",
+        "",
+        "🔤 Предметы можно писать сокращением:",
+    ]
+    for short, name in homework.abbreviations():
+        lines.append("%s — %s" % (short, name))
+    lines += ["", "/help — это сообщение"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -461,19 +509,22 @@ def run(argv):
         # запуск попробовал снова
         if not last:
             return 0
-        if previous and previous.get("text") == text:
+        if previous and same_schedule(previous.get("text"), text):
             return 0
         send(text, env("CHAT_ID"))
         mark_sent(state, day, text)
         save_state(state)
         return 0
 
-    if previous and previous.get("text") == text:
-        return 0  # уже отправляли ровно это — тихий выход
+    if previous and same_schedule(previous.get("text"), text):
+        return 0  # пары те же, что уже отправляли, — тихий выход
 
-    if previous:
+    old = (previous or {}).get("text") or ""
+    if previous and not old.startswith("⚠️"):
         text_to_send = "🔄 Расписание на завтра изменили\n\n" + text
     else:
+        # впервые, или раньше было «⚠️ ещё не выложили» — это не изменение,
+        # расписание просто появилось
         text_to_send = text
 
     send(text_to_send + extra, env("CHAT_ID"))

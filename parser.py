@@ -15,8 +15,10 @@
 Запуск:  python parser.py 04.09.26
 """
 
+import os
 import re
 import sys
+import time
 from datetime import date, datetime
 from urllib.parse import urljoin
 
@@ -45,8 +47,13 @@ HEADERS = {
 
 # Отметки вида «Выходной день» колледж пишет прямо в клетку пары. Это не
 # пара, а знак, что учёбы нет: показывать её с временем звонка нельзя.
+# Если день состоит только из таких отметок, бот пишет «пар нет, отдыхаем».
+# Чтобы добавить новую — допиши начало фразы через «|».
 DAY_OFF_RE = re.compile(
-    r"^\s*(выходн|праздн|нерабоч|каникул|день\s+методическ)", re.IGNORECASE)
+    r"^\s*(выходн|праздн|нерабоч|каникул"
+    r"|день\s+методическ"            # «День методической работы»
+    r"|день\s+самостоятельн"         # «День самостоятельной работы»
+    r")", re.IGNORECASE)
 
 
 def drop_day_off(lessons):
@@ -77,9 +84,26 @@ class ScheduleFileNotFound(ParserError):
 # --------------------------------------------------------------------------
 
 def _get(url):
-    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp
+    """
+    Скачать страницу сайта колледжа. Сайт иногда отвечает не сразу:
+    16.09 вечерняя рассылка упала с ReadTimeout. Поэтому в GitHub Actions
+    при тайм-ауте или обрыве пробуем ещё два раза с паузой.
+
+    На Vercel (там переменная VERCEL=1) — одна попытка: функции дают
+    30 секунд на всё, и повторы не уложились бы в это время.
+    """
+    attempts = 1 if os.environ.get("VERCEL") else 3
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt == attempts:
+                raise
+            print("сайт колледжа не ответил (%s), попытка %d из %d"
+                  % (type(exc).__name__, attempt, attempts))
+            time.sleep(10 * attempt)
 
 
 def fetch_index():
