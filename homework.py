@@ -93,7 +93,7 @@ MARKER_RE = re.compile(
 
 LOOKAHEAD_DAYS = 14     # на сколько дней вперёд ищем ближайшую пару предмета
 REMIND_BEFORE = 7       # за сколько дней до срока начинаем напоминать
-KEEP_DAYS = 3           # сколько дней держим уже прошедшие записи
+KEEP_DAYS = 7           # сколько дней после даты дз хранится, потом удаляется
 
 HOMEWORK_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "homework.json")
@@ -472,8 +472,26 @@ def load_doc():
 
 
 def load():
-    """(список записей, sha) — для тех, кому вопросы в ожидании не нужны."""
+    """
+    (список записей, sha) — для показа: напоминаний, /dz, меню удаления.
+
+    Заодно убирает из файла протухшее: дз, у которых дата прошла больше
+    KEEP_DAYS дней назад, и вопросы без ответа старше PENDING_HOURS. Иначе
+    чистка случалась бы только при новой записи, и если неделю никто не
+    пишет дз, старьё так и лежало бы в репозитории. Делается только там,
+    где есть доступ к GitHub (вебхук на Vercel); вечерняя рассылка в
+    Actions и локальные запуски файл не трогают.
+    """
     doc, sha = load_doc()
+    if _github()[0] and _prune(dict(doc, items=list(doc["items"]),
+                                    pending=list(doc["pending"]))):
+        try:
+            change(lambda d: True if _prune(d) else SKIP,
+                   "дз: удалены старые записи", prune=False)
+            sha = None                 # версия файла сменилась
+        except Exception as exc:       # не вышло — попробуем в следующий раз
+            print("дз: не смог убрать старые записи: %s" % exc)
+    _prune(doc)
     return doc["items"], sha
 
 
@@ -504,7 +522,7 @@ def save_doc(doc, sha=None, message="дз: запись из чата"):
                            % (resp.status_code, resp.text[:200]))
 
 
-def change(mutate, message="дз: запись из чата"):
+def change(mutate, message="дз: запись из чата", prune=True):
     """
     Прочитать homework.json, поправить функцией mutate(doc), записать.
 
@@ -512,11 +530,15 @@ def change(mutate, message="дз: запись из чата"):
     менять нечего, писать не будем. Если, пока мы правили, файл кто-то
     поменял (два человека написали дз в одну секунду), GitHub откажет —
     тогда перечитываем свежую версию и пробуем ещё раз.
+
+    Протухшие записи выбрасываются заодно с любой правкой (prune=False —
+    если mutate чистит сама).
     """
     last = None
     for _ in range(3):
         doc, sha = load_doc()
-        _prune(doc)
+        if prune:
+            _prune(doc)
         result = mutate(doc)
         if result is SKIP:
             return SKIP
@@ -529,15 +551,20 @@ def change(mutate, message="дз: запись из чата"):
 
 
 def _prune(doc, today=None):
-    """Выбросить давно прошедшие дз и вопросы, на которые так и не ответили."""
+    """
+    Выбросить дз, у которых дата прошла больше KEEP_DAYS дней назад, и
+    вопросы, на которые так и не ответили. Возвращает, сколько выбросила.
+    """
     today = today or _today()
     edge = (today - timedelta(days=KEEP_DAYS)).isoformat()
+    before = len(doc["items"]) + len(doc["pending"])
     doc["items"] = [i for i in doc["items"]
                     if str(i.get("for_date", "")) >= edge]
     fresh = (datetime.now(_tz()) - timedelta(hours=PENDING_HOURS)).strftime(
         "%Y-%m-%d %H:%M")
     doc["pending"] = [p for p in doc["pending"]
                       if str(p.get("created", "")) >= fresh]
+    return before - len(doc["items"]) - len(doc["pending"])
 
 
 def _date(item):
@@ -722,6 +749,11 @@ def _stamp(day):
 # --------------------------------------------------------------------------
 
 
+def _drop_row(update_id):
+    """Ряд с кнопкой «Отмена» — не записывать это дз вообще."""
+    return [{"text": "Отмена", "callback_data": "hw:drop:%s" % update_id}]
+
+
 def _question_text(note, deadline):
     if deadline:
         return "По какому предмету-то дз?\n«%s», срок %s" % (note, _stamp(deadline))
@@ -751,10 +783,11 @@ def _ask_subject(message, update_id, note, deadline, days):
     school_days = [day for day, lessons in days if lessons]
     next_day = school_days[0] if school_days else _today() + timedelta(days=1)
 
-    keyboard = {"inline_keyboard": [[
-        {"text": "Нет предмета", "callback_data": "hw:none:%s" % update_id},
-        {"text": "Сейчас напишу", "callback_data": "hw:wait:%s" % update_id},
-    ]]}
+    keyboard = {"inline_keyboard": [
+        [{"text": "Нет предмета", "callback_data": "hw:none:%s" % update_id},
+         {"text": "Сейчас напишу", "callback_data": "hw:wait:%s" % update_id}],
+        _drop_row(update_id),
+    ]}
     question = bot.send(_question_text(note, deadline), chat_id,
                         reply_markup=keyboard, reply_to=message.get("message_id"))
 
@@ -931,6 +964,7 @@ def on_callback(cb):
     Обработать нажатие. Кнопки бывают:
       hw:none:<id>              «Нет предмета»
       hw:wait:<id>              «Сейчас напишу»
+      hw:drop:<id>              «Отмена» — не записывать это дз
       hw:del:<id>:<кто открыл>  удалить дз
       hw:cancel:0:<кто открыл>  отмена удаления
     """
@@ -957,7 +991,7 @@ def on_callback(cb):
         return "кнопка: отмена удаления"
     if action == "del":
         return _press_delete(cb, key, chat_id, message_id)
-    if action in ("none", "wait"):
+    if action in ("none", "wait", "drop"):
         return _press_subject(cb, action, key, user_id, chat_id, message_id)
     return None
 
@@ -1009,6 +1043,9 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
                         doc["items"].append(item)
                     state.update(item=item, why_day=why)
                     return True
+                if action == "drop":
+                    doc["pending"].remove(p)   # просто забываем вопрос
+                    return True
                 return SKIP                # «Сейчас напишу»: пока ничего не меняем
         state["why"] = "gone"
         return SKIP
@@ -1033,6 +1070,12 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
               _recorded_text(state["item"], state.get("why_day", "")))
         _toast(cb, "Записал")
         return "кнопка: записал без предмета"
+
+    if action == "drop":
+        _edit(chat_id, message_id,
+              "🚫 Ок, не записываю «%s»." % state["p"].get("note"))
+        _toast(cb, "Отменил")
+        return "кнопка: запись дз отменена"
 
     # «Сейчас напишу»: шлём сообщение, на которое Telegram сразу откроет
     # ответ у автора (force_reply), и запоминаем его как ещё один вопрос
@@ -1059,8 +1102,10 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
     except Exception as exc:
         _storage_failed(exc, "ожидание предмета")
     deadline = date.fromisoformat(p["for_date"]) if p.get("for_date") else None
+    # «Отмена» оставляем — вдруг человек передумает, уже начав отвечать
     _edit(chat_id, message_id,
-          _question_text(p.get("note"), deadline) + "\n\nЖду ответ 👇")
+          _question_text(p.get("note"), deadline) + "\n\nЖду ответ 👇",
+          markup={"inline_keyboard": [_drop_row(key)]})
     _toast(cb, "")
     return "кнопка: ждём предмет (prompt=%s)" % prompt
 
@@ -1075,12 +1120,12 @@ def _toast(cb, text):
         print("дз: answerCallbackQuery: %s" % exc)
 
 
-def _edit(chat_id, message_id, text):
-    """Поменять текст сообщения; кнопки при этом исчезают."""
+def _edit(chat_id, message_id, text, markup=None):
+    """Поменять текст сообщения. Кнопки исчезают, если не передать новые."""
     try:
         import bot
         bot.call("editMessageText", chat_id=chat_id, message_id=message_id,
-                 text=text)
+                 text=text, reply_markup=markup)
     except Exception as exc:
         print("дз: editMessageText: %s" % exc)
 
