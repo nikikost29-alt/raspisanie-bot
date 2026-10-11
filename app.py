@@ -162,10 +162,10 @@ def handle_update(update):
         update_id, command, arg, chat_id, message_id, text.split("\n")[0])
 
 
-def report_to_owner(error_text):
+def report_to_owner(error_text, title="Вебхук расписания упал"):
     """Сообщить владельцу об ошибке. Сам при этом упасть не имеет права."""
     try:
-        bot.send("❌ Вебхук расписания упал:\n%s" % error_text, bot.env("OWNER_ID"))
+        bot.send("❌ %s:\n%s" % (title, error_text), bot.env("OWNER_ID"))
     except Exception as exc:
         print("не смог сообщить владельцу:", exc)
 
@@ -179,14 +179,64 @@ def env_report():
     """
     return {name: bool((os.environ.get(name) or "").strip())
             for name in ("BOT_TOKEN", "CHAT_ID", "OWNER_ID", "WEBHOOK_SECRET",
-                         "GITHUB_TOKEN")}
+                         "GITHUB_TOKEN", "CRON_SECRET")}
+
+
+CRON_PATHS = {"/api/cron/evening": False, "/api/cron/last": True}
+
+
+def run_cron(environ, start_response):
+    """
+    Вечерняя рассылка по расписанию Vercel (crons в vercel.json).
+
+    Vercel сам присылает заголовок «Authorization: Bearer <CRON_SECRET>».
+    Без него запускать нельзя — иначе любой, кто узнает адрес, сможет
+    дёргать рассылку. Если CRON_SECRET не завели, рассылка не идёт, и
+    владелец получает об этом сообщение.
+    """
+    last = CRON_PATHS[environ.get("PATH_INFO", "")]
+    secret = (os.environ.get("CRON_SECRET") or "").strip()
+    status, note = "200 OK", ""
+    if not secret:
+        note = "cron: в Vercel не задан CRON_SECRET, рассылка не запущена"
+        report_to_owner("в Vercel не задана переменная CRON_SECRET. "
+                        "Заведи её и сделай Redeploy.",
+                        "Вечерняя рассылка не запустилась")
+        status = "401 Unauthorized"
+    elif environ.get("HTTP_AUTHORIZATION", "") != "Bearer " + secret:
+        note = "cron: неверный секрет, игнор"
+        status = "401 Unauthorized"
+    else:
+        try:
+            note = "cron%s: %s" % (" (последний)" if last else "",
+                                   bot.cron(last))
+        except Exception:
+            trace = traceback.format_exc()
+            print(trace)
+            report_to_owner(trace[-1500:], "Вечерняя рассылка упала")
+            note = "cron: ошибка, подробности у владельца"
+            status = "500 Internal Server Error"
+    print(note)
+    body = json.dumps({"ok": status.startswith("200"), "note": note},
+                      ensure_ascii=False).encode("utf-8")
+    start_response(status, [
+        ("Content-Type", "application/json; charset=utf-8"),
+        ("Content-Length", str(len(body))),
+    ])
+    return [body]
 
 
 def app(environ, start_response):
     """
     WSGI-приложение. Telegram ВСЕГДА получает 200: любой другой код заставит
     его повторять доставку этого апдейта снова и снова.
+
+    Отдельно — адреса вечерней рассылки /api/cron/…: их зовёт не Telegram,
+    а расписание Vercel.
     """
+    if environ.get("PATH_INFO", "") in CRON_PATHS:
+        return run_cron(environ, start_response)
+
     note = "ok"
     extra = {}
     try:

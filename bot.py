@@ -15,12 +15,14 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import requests
 
 import homework
 import parser as schedule
+import storage
 
 # --------------------------------------------------------------------------
 # Константы
@@ -304,21 +306,41 @@ def send(text, chat_id, reply_markup=None, reply_to=None):
 # Состояние
 # --------------------------------------------------------------------------
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"sent": {}}
+# state.json — что и когда уже разослано. На Vercel он читается и пишется
+# через GitHub API (storage.py), в GitHub Actions и локально — с диска.
+STATE_PATH = "state.json"
+
+
+def _parse_state(raw):
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
-    except (ValueError, OSError):
-        return {"sent": {}}
-    state.setdefault("sent", {})
+        state = json.loads(raw or "{}")
+    except ValueError:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if not isinstance(state.get("sent"), dict):
+        state["sent"] = {}
     return state
 
 
+def load_state():
+    if storage.remote():
+        return _parse_state(storage.gh_read(STATE_PATH)[0])
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            return _parse_state(fh.read())
+    except OSError:
+        return {"sent": {}}
+
+
 def save_state(state):
+    """Только для диска: на Vercel запись идёт через _broadcast_remote()."""
     with open(STATE_FILE, "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False, indent=1)
+
+
+def _dump(state):
+    return json.dumps(state, ensure_ascii=False, indent=1)
 
 
 def mark_sent(state, day, text):
@@ -497,6 +519,129 @@ def help_text():
 
 # --------------------------------------------------------------------------
 
+def plan(previous, text, is_schedule, last):
+    """
+    Что отправить в чат по этому дню, или None — молчать.
+
+    previous — запись из state.json о прошлой отправке на этот день.
+    """
+    if not is_schedule:
+        # расписания ещё нет: молчим и не отмечаем дату, чтобы следующий
+        # запуск попробовал снова. Только последний за вечер предупреждает.
+        if not last:
+            return None
+        if previous and same_schedule(previous.get("text"), text):
+            return None
+        return text
+
+    if previous and same_schedule(previous.get("text"), text):
+        return None  # пары те же, что уже отправляли, — тихий выход
+
+    old = (previous or {}).get("text") or ""
+    if previous and not old.startswith("⚠️"):
+        return "🔄 Расписание на завтра изменили\n\n" + text
+    # впервые, или раньше было «⚠️ ещё не выложили» — это не изменение,
+    # расписание просто появилось
+    return text
+
+
+def broadcast(day, last=False):
+    """
+    Разослать расписание на day. Возвращает строку для лога: что сделано.
+
+    Блок с дз дописывается только при отправке и НЕ участвует в сравнении
+    с прошлым разом: иначе новое дз выглядело бы как «расписание изменили».
+    """
+    text, is_schedule = build(day)
+    extra = homework.block_for(day) if is_schedule else ""
+    if storage.remote():
+        return _broadcast_remote(day, text, is_schedule, last, extra)
+
+    state = load_state()
+    to_send = plan(state["sent"].get(day.isoformat()), text, is_schedule, last)
+    if to_send is None:
+        return "на %s отправлять нечего" % day.strftime("%d.%m")
+    send(to_send + extra, env("CHAT_ID"))
+    mark_sent(state, day, text)
+    save_state(state)
+    return "на %s отправлено: %s" % (day.strftime("%d.%m"), to_send.split("\n")[0])
+
+
+def _broadcast_remote(day, text, is_schedule, last, extra):
+    """
+    То же на Vercel, где state.json лежит в репозитории.
+
+    Vercel иногда вызывает один и тот же cron-запуск дважды. Чтобы группа не
+    получила расписание два раза, дата сначала «столбится» в state.json —
+    запись с версией файла (sha), — и только потом уходит сообщение. Второй
+    вызов получит от GitHub конфликт, перечитает файл, увидит, что эти пары
+    уже отправлены, и промолчит. Если отправка не удалась, запись убирается,
+    чтобы следующий запуск попробовал снова.
+    """
+    key = day.isoformat()
+    for attempt in range(3):
+        raw, sha = storage.gh_read(STATE_PATH)
+        state = _parse_state(raw)
+        previous = state["sent"].get(key)
+        to_send = plan(previous, text, is_schedule, last)
+        if to_send is None:
+            return "на %s отправлять нечего" % day.strftime("%d.%m")
+        mark_sent(state, day, text)
+        try:
+            storage.gh_write(STATE_PATH, _dump(state), sha,
+                             "state: отправлено расписание")
+            break
+        except storage.Conflict:
+            time.sleep(1 + attempt)     # кто-то записал раньше — перечитаем
+    else:
+        raise BotError("не смог застолбить %s в state.json: три конфликта подряд"
+                       % key)
+
+    try:
+        send(to_send + extra, env("CHAT_ID"))
+    except Exception:
+        _release(key, previous, text)
+        raise
+    return "на %s отправлено: %s" % (day.strftime("%d.%m"), to_send.split("\n")[0])
+
+
+def _release(key, previous, text):
+    """Отправка не удалась — вернуть запись о дне как было."""
+    for _ in range(3):
+        try:
+            raw, sha = storage.gh_read(STATE_PATH)
+            state = _parse_state(raw)
+            if (state["sent"].get(key) or {}).get("text") != text:
+                return                  # запись уже чужая — не трогаем
+            if previous is None:
+                state["sent"].pop(key, None)
+            else:
+                state["sent"][key] = previous
+            storage.gh_write(STATE_PATH, _dump(state), sha,
+                             "state: отправка не удалась, дата снова свободна")
+            return
+        except storage.Conflict:
+            continue
+        except Exception as exc:
+            print("не смог освободить %s в state.json: %s" % (key, exc))
+            return
+
+
+def cron(last=False):
+    """
+    Вечерний запуск по расписанию Vercel (см. crons в vercel.json).
+
+    Тут на всё есть до 5 минут, поэтому к медленному сайту колледжа можно
+    постучаться трижды — в отличие от ответов на команды.
+    """
+    attempts = schedule.ATTEMPTS
+    schedule.ATTEMPTS = 3
+    try:
+        return broadcast(tomorrow(), last)
+    finally:
+        schedule.ATTEMPTS = attempts
+
+
 def run(argv):
     dry = "--dry" in argv
     last = "--last" in argv
@@ -504,44 +649,12 @@ def run(argv):
     rest = [a for a in argv[1:] if not a.startswith("-")]
     day = schedule._parse_date(rest[0]) if rest else tomorrow()
 
-    text, is_schedule = build(day)
-    # Блок с дз дописывается только при отправке и НЕ участвует в сравнении
-    # с прошлым разом: иначе новое дз выглядело бы как «расписание изменили».
-    extra = homework.block_for(day) if is_schedule else ""
-
     if dry:
-        print(text + extra)
+        text, is_schedule = build(day)
+        print(text + (homework.block_for(day) if is_schedule else ""))
         return 0
 
-    state = load_state()
-    previous = state["sent"].get(day.isoformat())
-
-    if not is_schedule:
-        # расписания ещё нет: молчим и не отмечаем дату, чтобы следующий
-        # запуск попробовал снова
-        if not last:
-            return 0
-        if previous and same_schedule(previous.get("text"), text):
-            return 0
-        send(text, env("CHAT_ID"))
-        mark_sent(state, day, text)
-        save_state(state)
-        return 0
-
-    if previous and same_schedule(previous.get("text"), text):
-        return 0  # пары те же, что уже отправляли, — тихий выход
-
-    old = (previous or {}).get("text") or ""
-    if previous and not old.startswith("⚠️"):
-        text_to_send = "🔄 Расписание на завтра изменили\n\n" + text
-    else:
-        # впервые, или раньше было «⚠️ ещё не выложили» — это не изменение,
-        # расписание просто появилось
-        text_to_send = text
-
-    send(text_to_send + extra, env("CHAT_ID"))
-    mark_sent(state, day, text)
-    save_state(state)
+    print("рассылка: %s" % broadcast(day, last))
     return 0
 
 

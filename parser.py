@@ -83,16 +83,19 @@ class ScheduleFileNotFound(ParserError):
 # Загрузка
 # --------------------------------------------------------------------------
 
+# Сколько раз стучаться к сайту колледжа. None — по умолчанию: на Vercel
+# одна попытка (ответ на команду должен прийти быстро), иначе три.
+# Вечерняя рассылка на Vercel ставит 3 на время своего запуска.
+ATTEMPTS = None
+
+
 def _get(url):
     """
     Скачать страницу сайта колледжа. Сайт иногда отвечает не сразу:
-    16.09 вечерняя рассылка упала с ReadTimeout. Поэтому в GitHub Actions
-    при тайм-ауте или обрыве пробуем ещё два раза с паузой.
-
-    На Vercel (там переменная VERCEL=1) — одна попытка: функции дают
-    30 секунд на всё, и повторы не уложились бы в это время.
+    16.09 вечерняя рассылка упала с ReadTimeout. Поэтому при тайм-ауте или
+    обрыве пробуем ещё раз с паузой — см. ATTEMPTS.
     """
-    attempts = 1 if os.environ.get("VERCEL") else 3
+    attempts = ATTEMPTS or (1 if os.environ.get("VERCEL") else 3)
     for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)

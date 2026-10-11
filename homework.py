@@ -21,15 +21,13 @@
   * в GitHub Actions и локально файл просто лежит рядом и читается с диска.
 """
 
-import base64
 import json
 import os
 import re
 from datetime import date, datetime, timedelta
 
-import requests
-
 import parser as schedule
+import storage
 
 # --------------------------------------------------------------------------
 # СЛОВАРЬ ПРЕДМЕТОВ — сюда можно и нужно дописывать свои слова
@@ -97,9 +95,7 @@ KEEP_DAYS = 7           # сколько дней после даты дз хр�
 
 HOMEWORK_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "homework.json")
-GITHUB_API = "https://api.github.com/repos/%s/contents/%s"
 GITHUB_PATH = "homework.json"
-TIMEOUT = 30
 
 LESSON, DEADLINE = "lesson", "deadline"
 
@@ -420,15 +416,14 @@ PENDING_HOURS = 24      # сколько ждём ответа «по каком
 SKIP = object()         # change(): «менять нечего, не записывай»
 
 
-class Conflict(Exception):
-    """Файл на GitHub успели поменять, пока мы его правили."""
+# Чтение и запись через GitHub API живут в storage.py — тем же путём
+# хранится и state.json вечерней рассылки.
+Conflict = storage.Conflict
 
 
 def _github():
-    """(токен, репозиторий) если вебхук настроен писать в репозиторий."""
-    token = (os.environ.get("GITHUB_TOKEN") or "").strip()
-    repo = (os.environ.get("GITHUB_REPO") or "nikikost29-alt/raspisanie-bot").strip()
-    return (token, repo) if token else (None, repo)
+    """(токен, репозиторий). Токена нет — значит, работаем с диском."""
+    return storage.github()
 
 
 def _doc(raw):
@@ -451,19 +446,9 @@ def load_doc():
     (документ, sha). sha — версия файла на GitHub: по ней GitHub поймёт,
     если кто-то успел записать раньше нас, и не даст затереть чужую правку.
     """
-    token, repo = _github()
-    if token:
-        resp = requests.get(
-            GITHUB_API % (repo, GITHUB_PATH),
-            headers={"Authorization": "Bearer %s" % token,
-                     "Accept": "application/vnd.github+json"},
-            timeout=TIMEOUT)
-        if resp.status_code == 404:
-            return _doc(""), None
-        resp.raise_for_status()
-        payload = resp.json()
-        raw = base64.b64decode(payload["content"]).decode("utf-8")
-        return _doc(raw), payload.get("sha")
+    if _github()[0]:
+        raw, sha = storage.gh_read(GITHUB_PATH)
+        return _doc(raw), sha
 
     if not os.path.exists(HOMEWORK_FILE):
         return _doc(""), None
@@ -498,28 +483,11 @@ def load():
 def save_doc(doc, sha=None, message="дз: запись из чата"):
     """Записать документ. На Vercel — коммитом в репозиторий, иначе на диск."""
     body = json.dumps(doc, ensure_ascii=False, indent=1)
-    token, repo = _github()
-    if not token:
+    if not _github()[0]:
         with open(HOMEWORK_FILE, "w", encoding="utf-8") as fh:
             fh.write(body)
         return
-
-    data = {
-        "message": message + " [skip ci]",
-        "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
-    }
-    if sha:
-        data["sha"] = sha
-    resp = requests.put(
-        GITHUB_API % (repo, GITHUB_PATH),
-        headers={"Authorization": "Bearer %s" % token,
-                 "Accept": "application/vnd.github+json"},
-        json=data, timeout=TIMEOUT)
-    if resp.status_code in (409, 422):
-        raise Conflict("GitHub: файл успели поменять (HTTP %s)" % resp.status_code)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError("GitHub не принял homework.json: HTTP %s %s"
-                           % (resp.status_code, resp.text[:200]))
+    storage.gh_write(GITHUB_PATH, body, sha, message)
 
 
 def change(mutate, message="дз: запись из чата", prune=True):

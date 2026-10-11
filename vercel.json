@@ -1,8 +1,15 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- . ':(exclude)state.json' ':(exclude)homework.json'",
   "functions": {
     "app.py": {
-      "maxDuration": 30
+      "maxDuration": 300
     }
-  }
+  },
+  "crons": [
+    { "path": "/api/cron/evening", "schedule": "0 13 * * *" },
+    { "path": "/api/cron/evening", "schedule": "0 14 * * *" },
+    { "path": "/api/cron/evening", "schedule": "0 15 * * *" },
+    { "path": "/api/cron/last", "schedule": "0 16 * * *" }
+  ]
 }
