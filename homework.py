@@ -308,18 +308,29 @@ def _keys(names):
     Ключ срабатывает, если в заметке нашлись ВСЕ его кусочки.
     """
     phrases = {}
-    for name in names:
+    for name in list(names) + [n for n in SUBJECTS if n not in names]:
         phrases[name] = [name] + list(SUBJECTS.get(name, []))
 
-    # Отличительные слова: встречаются в названии только одного предмета.
-    # «сопровождения» узнаёт ИТП, а «информационных» — ничего, оно у трёх.
+    # Отличительные слова: корень, с которого не начинается ни одно слово
+    # других предметов. «сопровождения» узнаёт ИТП, а «системы» — ничего:
+    # «систем…» есть ещё у трёх. Сравниваем со ВСЕМИ известными предметами,
+    # а не только с ближайшими днями — иначе, если ИСТ и ВИС на этой неделе
+    # нет, «система» вдруг стала бы признаком УФИС.
+    words_of = {name: {w for phrase in items for w in _norm(phrase).split()}
+                for name, items in phrases.items()}
     owners = {}
-    for name, items in phrases.items():
-        for phrase in items:
-            for word in _norm(phrase).split():
-                if len(word) >= 7:
-                    owners.setdefault(_stem(word), set()).add(name)
+    for name in names:
+        for word in words_of[name]:
+            if len(word) < 7:
+                continue
+            stem = _stem(word)
+            clash = any(w.startswith(stem) or stem.startswith(w)
+                        for other, ws in words_of.items() if other != name
+                        for w in ws if len(w) >= 4)
+            if not clash:
+                owners.setdefault(stem, set()).add(name)
 
+    phrases = {name: phrases[name] for name in names}
     keys = []
     for name, items in phrases.items():
         for i, phrase in enumerate(items):
@@ -656,7 +667,7 @@ def _catch(message, update_id, today=None):
         names = live + [n for n in SUBJECTS if n not in live]
         subject = best_subject(note, names, order=live)
         if subject is None:
-            return _ask_subject(message, update_id, note, deadline)
+            return _ask_subject(message, update_id, note, deadline, days)
         return say(_record(update_id, author, subject, note, deadline, DEADLINE))
 
     subject = best_subject(note, live, order=live)
@@ -667,11 +678,7 @@ def _catch(message, update_id, today=None):
 
     if not at_start:
         return None  # маркер посреди болтовни, предмета нет — молчим
-
-    hint = "\n".join("• " + name for name in live[:9])
-    return say("Не понял, по какому предмету. Вот что есть в ближайшие дни:\n%s\n\n"
-               "Можно писать сокращением: !дз уфис конспект\n"
-               "А если есть срок: !дз уфис курсовая до 15.12" % hint)
+    return _ask_subject(message, update_id, note, None, days)
 
 
 def _record(item_id, author, subject, note, day, kind):
@@ -692,12 +699,12 @@ def _record(item_id, author, subject, note, day, kind):
     return _recorded_text(item)
 
 
-def _recorded_text(item):
+def _recorded_text(item, why=""):
     day = _date(item)
     title = item.get("subject") or "без предмета"
     if _kind(item) == LESSON:
-        return "✍️ Записал: %s, %s. Напомню вечером накануне." % (
-            title, day.strftime("%d.%m"))
+        return "✍️ Записал: %s, %s%s. Напомню вечером накануне." % (
+            title, day.strftime("%d.%m"), why)
     start = day - timedelta(days=REMIND_BEFORE)
     if start <= _today():
         when = "Буду напоминать в расписании каждый день до срока."
@@ -711,38 +718,58 @@ def _stamp(day):
 
 
 # --------------------------------------------------------------------------
-# «По какому предмету-то дз?» — для дз со сроком, где предмет не узнан
+# «По какому предмету-то дз?» — когда предмет не узнан
 # --------------------------------------------------------------------------
 
 
-def _ask_subject(message, update_id, note, deadline):
+def _question_text(note, deadline):
+    if deadline:
+        return "По какому предмету-то дз?\n«%s», срок %s" % (note, _stamp(deadline))
+    return "По какому предмету-то дз?\n«%s»" % note
+
+
+def _ask_subject(message, update_id, note, deadline, days):
     """
     Задать вопрос с двумя кнопками и запомнить дз «в ожидании».
 
     Ключ ожидания — update_id исходного сообщения: он уникален и влезает
     в callback_data кнопки (там лимит 64 байта).
+
+    Вместе с вопросом запоминаем ближайшую дату каждого предмета и ближайший
+    учебный день — тогда на ответ «уфис» бот сразу поставит дз на ближайшую
+    пару УФИС, не скачивая расписание с сайта ещё раз.
     """
     import bot
 
     chat_id = (message.get("chat") or {}).get("id")
     sender = message.get("from") or {}
+    lesson_days = {}
+    for day, lessons in days:
+        for lesson in lessons:
+            lesson_days.setdefault(subject_of(lesson["text"]), day.isoformat())
+    lesson_days.pop("", None)
+    school_days = [day for day, lessons in days if lessons]
+    next_day = school_days[0] if school_days else _today() + timedelta(days=1)
+
     keyboard = {"inline_keyboard": [[
         {"text": "Нет предмета", "callback_data": "hw:none:%s" % update_id},
         {"text": "Сейчас напишу", "callback_data": "hw:wait:%s" % update_id},
     ]]}
-    question = bot.send(
-        "По какому предмету-то дз?\n«%s», срок %s" % (note, _stamp(deadline)),
-        chat_id, reply_markup=keyboard, reply_to=message.get("message_id"))
+    question = bot.send(_question_text(note, deadline), chat_id,
+                        reply_markup=keyboard, reply_to=message.get("message_id"))
 
     pending = {
         "id": update_id,
+        "kind": DEADLINE if deadline else LESSON,
         "chat_id": chat_id,
         "user_id": sender.get("id"),
         "author": (sender.get("first_name") or "").strip(),
         "message_id": message.get("message_id"),
         "msg_ids": [question],         # ответ на любое из них — это предмет
         "note": note,
-        "for_date": deadline.isoformat(),
+        "for_date": deadline.isoformat() if deadline else None,
+        "next_day": next_day.isoformat(),
+        "lesson_days": lesson_days,
         "created": _now(),
     }
 
@@ -755,9 +782,40 @@ def _ask_subject(message, update_id, note, deadline):
         change(add, "дз: ждём предмет")
     except Exception as exc:
         bot.call("editMessageText", chat_id=chat_id, message_id=question,
-                 text=_storage_failed(exc, "дз со сроком %s" % _stamp(deadline)))
+                 text=_storage_failed(exc, "дз «%s»" % note))
         return "#%s: дз -> вопрос задан, но не сохранён" % update_id
     return "#%s: дз -> спросил предмет (message_id=%s)" % (update_id, question)
+
+
+def _resolve(p, answer=None):
+    """
+    Во что превращается дз «в ожидании», когда ясен (или не нужен) предмет.
+
+    Возвращает готовую запись и пояснение к дате (может быть пустым).
+    answer=None — нажали «Нет предмета».
+    """
+    lesson_days = p.get("lesson_days") or {}
+    names = list(lesson_days) + [n for n in SUBJECTS if n not in lesson_days]
+    subject = None
+    if answer is not None:
+        subject = best_subject(answer, names, order=list(lesson_days)) \
+            or _as_subject(answer)
+
+    # у вопросов, заданных до этой версии, поля kind нет, но есть срок
+    kind = p.get("kind") or (DEADLINE if p.get("for_date") else LESSON)
+    why = ""
+    if kind == DEADLINE:
+        day = date.fromisoformat(p["for_date"])
+    elif subject in lesson_days:
+        day = date.fromisoformat(lesson_days[subject])
+    else:
+        # предмета нет или его нет в ближайшие две недели — ставим на
+        # ближайший учебный день, чтобы напоминание вообще когда-то пришло
+        day = date.fromisoformat(p.get("next_day") or
+                                 (_today() + timedelta(days=1)).isoformat())
+        why = " (ближайший учебный день)"
+    return _new_item(p["id"], p.get("author"), subject, p.get("note"), day,
+                     kind), why
 
 
 def _subject_answer(message):
@@ -778,14 +836,11 @@ def _subject_answer(message):
                     str(p.get("chat_id")) == str(chat_id):
                 if p.get("user_id") != user_id:
                     return SKIP            # отвечает не тот, чьё это дз
-                subject = best_subject(text, list(SUBJECTS)) or _as_subject(text)
-                item = _new_item(p["id"], p.get("author"), subject,
-                                 p.get("note"), date.fromisoformat(p["for_date"]),
-                                 DEADLINE)
+                item, why = _resolve(p, text)
                 doc["pending"].remove(p)
                 if not any(i.get("id") == p["id"] for i in doc["items"]):
                     doc["items"].append(item)
-                found.update(item=item, question=p["msg_ids"][0])
+                found.update(item=item, why=why, question=p["msg_ids"][0])
                 return True
         return SKIP                        # это ответ боту, но не на вопрос
 
@@ -799,7 +854,7 @@ def _subject_answer(message):
         return None
 
     _drop_buttons(chat_id, found["question"])
-    answer = _recorded_text(found["item"])
+    answer = _recorded_text(found["item"], found["why"])
     bot.send(answer, chat_id, reply_to=message.get("message_id"))
     return "дз: предмет получен -> %s" % answer
 
@@ -948,12 +1003,11 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
                     return SKIP
                 state["p"] = dict(p)
                 if action == "none":
-                    item = _new_item(key, p.get("author"), None, p.get("note"),
-                                     date.fromisoformat(p["for_date"]), DEADLINE)
+                    item, why = _resolve(p, None)
                     doc["pending"].remove(p)
                     if not any(i.get("id") == key for i in doc["items"]):
                         doc["items"].append(item)
-                    state["item"] = item
+                    state.update(item=item, why_day=why)
                     return True
                 return SKIP                # «Сейчас напишу»: пока ничего не меняем
         state["why"] = "gone"
@@ -975,14 +1029,20 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
         return "кнопка %s: вопрос уже закрыт" % action
 
     if action == "none":
-        _edit(chat_id, message_id, _recorded_text(state["item"]))
+        _edit(chat_id, message_id,
+              _recorded_text(state["item"], state.get("why_day", "")))
         _toast(cb, "Записал")
         return "кнопка: записал без предмета"
 
     # «Сейчас напишу»: шлём сообщение, на которое Telegram сразу откроет
     # ответ у автора (force_reply), и запоминаем его как ещё один вопрос
     p = state["p"]
-    prompt = bot.send("Напиши предмет ответом на это сообщение 👇", chat_id,
+    prompt_text = "Напиши предмет ответом на это сообщение 👇"
+    upcoming_names = [n for n in (p.get("lesson_days") or {}) if n]
+    if upcoming_names:
+        prompt_text += "\nВ ближайшие дни: %s" % ", ".join(
+            _short_subject(n) for n in upcoming_names)
+    prompt = bot.send(prompt_text, chat_id,
                       reply_markup={"force_reply": True, "selective": True,
                                     "input_field_placeholder": "например, уфис"},
                       reply_to=p.get("message_id"))
@@ -998,8 +1058,9 @@ def _press_subject(cb, action, key, user_id, chat_id, message_id):
         change(remember_prompt, "дз: ждём предмет")
     except Exception as exc:
         _storage_failed(exc, "ожидание предмета")
-    _edit(chat_id, message_id, "По какому предмету-то дз?\n«%s», срок %s\n\n"
-          "Жду ответ 👇" % (p.get("note"), _stamp(date.fromisoformat(p["for_date"]))))
+    deadline = date.fromisoformat(p["for_date"]) if p.get("for_date") else None
+    _edit(chat_id, message_id,
+          _question_text(p.get("note"), deadline) + "\n\nЖду ответ 👇")
     _toast(cb, "")
     return "кнопка: ждём предмет (prompt=%s)" % prompt
 
