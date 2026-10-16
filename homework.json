@@ -19,5 +19,22 @@
    "added": "2026-10-15 16:58"
   }
  ],
- "pending": []
+ "pending": [
+  {
+   "id": 866805763,
+   "kind": "lesson",
+   "chat_id": -1002026670827,
+   "user_id": 1385310558,
+   "author": "Скачать",
+   "message_id": 4976,
+   "msg_ids": [
+    4977
+   ],
+   "note": "уабд доклад на 20 мин сделать",
+   "for_date": null,
+   "next_day": "2026-10-17",
+   "lesson_days": {},
+   "created": "2026-10-16 15:36"
+  }
+ ]
 }
